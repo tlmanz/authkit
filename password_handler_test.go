@@ -2,6 +2,7 @@ package authkit
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -11,6 +12,16 @@ import (
 )
 
 // ── Mock UserStore ───────────────────────────────────────────────────────────
+
+// failingUserStore always returns an internal error (not a sentinel error).
+type failingUserStore struct{}
+
+func (failingUserStore) CreateUser(_ context.Context, _, _, _ string) error {
+	return fmt.Errorf("database connection failed")
+}
+func (failingUserStore) GetUserByEmail(_ context.Context, _ string) (*PasswordUser, error) {
+	return nil, fmt.Errorf("database connection failed")
+}
 
 type mockUserStore struct {
 	mu    sync.RWMutex
@@ -443,5 +454,133 @@ func TestNew_PasswordMode_NoCallbackBaseURL_OK(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("password mode should not require CallbackBaseURL: %v", err)
+	}
+}
+
+// ── Edge case: internal store error (not sentinel) ──────────────────────────
+
+func TestRegister_InternalStoreError(t *testing.T) {
+	a := &Auth{
+		cfg: Config{
+			Mode:          AuthModePassword,
+			SessionSecret: testSecret,
+			AfterLoginURL: "/dashboard",
+			UserStore:     failingUserStore{},
+		},
+		store: newCookieStore(testSecret, false),
+		rbac:  newRBAC(Policy{}),
+		log:   defaultLogger{},
+	}
+
+	w := httptest.NewRecorder()
+	a.Register(w, postForm("/auth/register", url.Values{
+		"email":    {"alice@example.com"},
+		"password": {"strong-password-123"},
+	}))
+
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("status: got %d, want %d", w.Code, http.StatusInternalServerError)
+	}
+}
+
+func TestLogin_InternalStoreError(t *testing.T) {
+	a := &Auth{
+		cfg: Config{
+			Mode:          AuthModePassword,
+			SessionSecret: testSecret,
+			AfterLoginURL: "/dashboard",
+			UserStore:     failingUserStore{},
+		},
+		store: newCookieStore(testSecret, false),
+		rbac:  newRBAC(Policy{}),
+		log:   defaultLogger{},
+	}
+
+	w := httptest.NewRecorder()
+	a.Login(w, postForm("/auth/login", url.Values{
+		"email":    {"alice@example.com"},
+		"password": {"any-password"},
+	}))
+
+	// failingUserStore returns a non-sentinel error, so the dummy bcrypt
+	// compare runs and 401 is returned (same as unknown user).
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("status: got %d, want %d", w.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestRegister_BothMode_Works(t *testing.T) {
+	a := &Auth{
+		cfg: Config{
+			Mode:          AuthModeBoth,
+			SessionSecret: testSecret,
+			AfterLoginURL: "/dashboard",
+			UserStore:     newMockUserStore(),
+		},
+		store: newCookieStore(testSecret, false),
+		rbac:  newRBAC(Policy{}),
+		log:   defaultLogger{},
+	}
+
+	w := httptest.NewRecorder()
+	a.Register(w, postForm("/auth/register", url.Values{
+		"email":    {"alice@example.com"},
+		"password": {"strong-password-123"},
+	}))
+
+	if w.Code != http.StatusSeeOther {
+		t.Errorf("status: got %d, want %d", w.Code, http.StatusSeeOther)
+	}
+}
+
+func TestLogin_BothMode_Works(t *testing.T) {
+	store := newMockUserStore()
+	hashed, _ := HashPassword("correct-password")
+	store.users["alice@example.com"] = &PasswordUser{
+		Email:          "alice@example.com",
+		Name:           "Alice",
+		HashedPassword: hashed,
+	}
+
+	a := &Auth{
+		cfg: Config{
+			Mode:          AuthModeBoth,
+			SessionSecret: testSecret,
+			AfterLoginURL: "/dashboard",
+			UserStore:     store,
+		},
+		store: newCookieStore(testSecret, false),
+		rbac:  newRBAC(Policy{}),
+		log:   defaultLogger{},
+	}
+
+	w := httptest.NewRecorder()
+	a.Login(w, postForm("/auth/login", url.Values{
+		"email":    {"alice@example.com"},
+		"password": {"correct-password"},
+	}))
+
+	if w.Code != http.StatusSeeOther {
+		t.Errorf("status: got %d, want %d", w.Code, http.StatusSeeOther)
+	}
+}
+
+func TestRegister_EmailNormalized(t *testing.T) {
+	store := newMockUserStore()
+	a := buildPasswordAuth(t, store)
+
+	w := httptest.NewRecorder()
+	a.Register(w, postForm("/auth/register", url.Values{
+		"email":    {"  Alice@Example.COM  "},
+		"password": {"strong-password-123"},
+	}))
+
+	if w.Code != http.StatusSeeOther {
+		t.Errorf("status: got %d, want %d", w.Code, http.StatusSeeOther)
+	}
+
+	// Verify stored email is normalized.
+	if _, ok := store.users["alice@example.com"]; !ok {
+		t.Error("email should be normalized to lowercase")
 	}
 }
