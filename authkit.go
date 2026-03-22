@@ -26,7 +26,6 @@ package authkit
 import (
 	"context"
 	"fmt"
-	"log"
 	"net/http"
 	"net/url"
 	"time"
@@ -93,6 +92,10 @@ type Config struct {
 	// PasswordPolicy configures password validation rules.
 	// If nil, defaults are used (minimum 8 characters).
 	PasswordPolicy *PasswordPolicy
+
+	// Logger is used for diagnostic output. If nil, logs are written to the
+	// standard library log package.
+	Logger Logger
 }
 
 // Auth is the central object. Create one with New() and attach its methods as
@@ -101,6 +104,7 @@ type Auth struct {
 	cfg   Config
 	store sessions.Store
 	rbac  *rbac
+	log   Logger
 }
 
 // New validates the config, registers the OAuth providers with goth, loads the
@@ -136,8 +140,12 @@ func New(cfg Config) (*Auth, error) {
 		return nil, fmt.Errorf("authkit: UserStore is required when password auth is enabled")
 	}
 
+	if cfg.Logger == nil {
+		cfg.Logger = defaultLogger{}
+	}
+
 	if !cfg.SecureCookie {
-		log.Println("authkit: WARNING: SecureCookie is false — session cookies will be sent over HTTP. Set SecureCookie to true in production.")
+		cfg.Logger.Info("authkit: WARNING: SecureCookie is false — session cookies will be sent over HTTP. Set SecureCookie to true in production.")
 	}
 
 	if cfg.AfterLoginURL == "" {
@@ -178,7 +186,7 @@ func New(cfg Config) (*Auth, error) {
 		return nil, fmt.Errorf("authkit: load RBAC policy: %w", err)
 	}
 
-	return &Auth{cfg: cfg, store: store, rbac: r}, nil
+	return &Auth{cfg: cfg, store: store, rbac: r, log: cfg.Logger}, nil
 }
 
 // WatchRBAC starts a background goroutine that reloads the RBAC policy file

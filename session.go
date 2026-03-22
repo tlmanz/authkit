@@ -4,7 +4,6 @@ import (
 	"encoding/gob"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 
 	"github.com/gorilla/sessions"
@@ -57,7 +56,7 @@ func saveUserToSession(store sessions.Store, w http.ResponseWriter, r *http.Requ
 
 // userFromSession reads the User from the gorilla session cookie.
 // Returns nil, nil when the session exists but contains no user (not logged in).
-func userFromSession(store sessions.Store, r *http.Request) (*User, error) {
+func userFromSession(store sessions.Store, r *http.Request, log ...Logger) (*User, error) {
 	sess, err := store.Get(r, sessionName)
 	if err != nil {
 		return nil, nil // corrupt or missing cookie — treat as unauthenticated
@@ -76,7 +75,9 @@ func userFromSession(store sessions.Store, r *http.Request) (*User, error) {
 	if permRaw, ok := sess.Values["permissions"].(string); ok && permRaw != "" {
 		var perms []string
 		if err := json.Unmarshal([]byte(permRaw), &perms); err != nil {
-			log.Printf("authkit: failed to deserialize session permissions: %v", err)
+			if len(log) > 0 && log[0] != nil {
+				log[0].Error("authkit: failed to deserialize session permissions: %v", err)
+			}
 		} else {
 			u.permissions = perms
 		}

@@ -13,6 +13,7 @@ authkit is a Go authentication library that provides:
 - Encrypted cookie-based sessions
 - YAML-based role-based access control (RBAC)
 - `net/http` middleware for protecting routes
+- Pluggable logger interface (bring your own or use the default)
 
 It does NOT include: database drivers, user registration UI, rate limiting, or email verification. These are the consumer's responsibility.
 
@@ -428,7 +429,66 @@ func adminHandler(w http.ResponseWriter, r *http.Request) {
 }
 ```
 
-### Step 7: Set environment variables
+### Step 7: Configure a custom logger (optional)
+
+By default, authkit logs to Go's standard `log` package. To route authkit's logs into your application's logging system, implement the `authkit.Logger` interface:
+
+```go
+type Logger interface {
+    Info(msg string, args ...any)
+    Error(msg string, args ...any)
+}
+```
+
+- `Info` is called for informational messages (e.g. startup warnings about `SecureCookie`).
+- `Error` is called for error conditions (e.g. failed OAuth callbacks, session errors, registration errors).
+- The `msg` parameter uses `fmt.Sprintf`-style formatting with `args`.
+- If `Logger` is nil in `Config`, a default implementation using the standard `log` package is used.
+
+**Example: slog adapter**
+
+```go
+type slogAdapter struct {
+    l *slog.Logger
+}
+
+func (s slogAdapter) Info(msg string, args ...any)  { s.l.Info(fmt.Sprintf(msg, args...)) }
+func (s slogAdapter) Error(msg string, args ...any) { s.l.Error(fmt.Sprintf(msg, args...)) }
+
+auth, err := authkit.New(authkit.Config{
+    Logger: slogAdapter{l: slog.Default()},
+    // ...
+})
+```
+
+**Example: zap adapter**
+
+```go
+type zapAdapter struct {
+    l *zap.SugaredLogger
+}
+
+func (z zapAdapter) Info(msg string, args ...any)  { z.l.Infof(msg, args...) }
+func (z zapAdapter) Error(msg string, args ...any) { z.l.Errorf(msg, args...) }
+
+auth, err := authkit.New(authkit.Config{
+    Logger: zapAdapter{l: zapLogger.Sugar()},
+    // ...
+})
+```
+
+**Example: zerolog adapter**
+
+```go
+type zerologAdapter struct {
+    l zerolog.Logger
+}
+
+func (z zerologAdapter) Info(msg string, args ...any)  { z.l.Info().Msgf(msg, args...) }
+func (z zerologAdapter) Error(msg string, args ...any) { z.l.Error().Msgf(msg, args...) }
+```
+
+### Step 8: Set environment variables
 
 ```bash
 # Required for all modes
@@ -478,6 +538,14 @@ type PasswordUser struct {
 // PasswordPolicy configures password validation.
 type PasswordPolicy struct {
     MinLength int // default: 8
+}
+
+// Logger is the interface for authkit diagnostic output.
+// Implement this to route logs into your logging system.
+// If nil in Config, defaults to the standard log package.
+type Logger interface {
+    Info(msg string, args ...any)
+    Error(msg string, args ...any)
 }
 ```
 
@@ -742,4 +810,5 @@ Use this checklist to verify your integration is complete:
 - [ ] Set `SecureCookie: true` for production
 - [ ] Started `WatchRBAC` goroutine if you want live policy reload
 - [ ] Applied rate limiting middleware to `/auth/login` and `/auth/register`
+- [ ] (Optional) Configured custom `Logger` to route authkit logs to your logging system
 - [ ] Tested login, logout, session persistence, and permission checks

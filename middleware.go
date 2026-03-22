@@ -10,7 +10,7 @@ import (
 // handlers can call UserFromCtx(r.Context()).
 func (a *Auth) RequireAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		u, err := userFromSession(a.store, r)
+		u, err := userFromSession(a.store, r, a.log)
 		if err != nil || u == nil {
 			http.Error(w, "unauthenticated", http.StatusUnauthorized)
 			return
@@ -29,7 +29,7 @@ func (a *Auth) RequireAuth(next http.Handler) http.Handler {
 func (a *Auth) Require(permission string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			u, err := userFromSession(a.store, r)
+			u, err := userFromSession(a.store, r, a.log)
 			if err != nil || u == nil {
 				http.Error(w, "unauthenticated", http.StatusUnauthorized)
 				return

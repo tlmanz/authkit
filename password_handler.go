@@ -2,7 +2,6 @@ package authkit
 
 import (
 	"errors"
-	"log"
 	"net/http"
 	"strings"
 
@@ -35,7 +34,7 @@ func (a *Auth) Register(w http.ResponseWriter, r *http.Request) {
 
 	hashed, err := HashPassword(password)
 	if err != nil {
-		log.Printf("authkit: hash error during registration: %v", err)
+		a.log.Error("authkit: hash error during registration: %v", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
@@ -45,7 +44,7 @@ func (a *Auth) Register(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "user already exists", http.StatusConflict)
 			return
 		}
-		log.Printf("authkit: register error: %v", err)
+		a.log.Error("authkit: register error: %v", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
@@ -61,7 +60,7 @@ func (a *Auth) Register(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := saveUserToSession(a.store, w, r, u); err != nil {
-		log.Printf("authkit: session error during registration: %v", err)
+		a.log.Error("authkit: session error during registration: %v", err)
 		http.Error(w, "session error", http.StatusInternalServerError)
 		return
 	}
@@ -106,7 +105,7 @@ func (a *Auth) Login(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := saveUserToSession(a.store, w, r, u); err != nil {
-		log.Printf("authkit: session error during login: %v", err)
+		a.log.Error("authkit: session error during login: %v", err)
 		http.Error(w, "session error", http.StatusInternalServerError)
 		return
 	}

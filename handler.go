@@ -2,7 +2,6 @@ package authkit
 
 import (
 	"encoding/json"
-	"log"
 	"net/http"
 
 	"github.com/markbates/goth/gothic"
@@ -22,7 +21,7 @@ func (a *Auth) BeginAuth(w http.ResponseWriter, r *http.Request) {
 func (a *Auth) Callback(w http.ResponseWriter, r *http.Request) {
 	gothUser, err := gothic.CompleteUserAuth(w, r)
 	if err != nil {
-		log.Printf("authkit: OAuth callback error: %v", err)
+		a.log.Error("authkit: OAuth callback error: %v", err)
 		http.Error(w, "authentication failed", http.StatusUnauthorized)
 		return
 	}
@@ -63,7 +62,7 @@ func (a *Auth) Me(w http.ResponseWriter, r *http.Request) {
 	if u == nil {
 		// Me can also be called without RequireAuth in the chain — handle that.
 		var err error
-		u, err = userFromSession(a.store, r)
+		u, err = userFromSession(a.store, r, a.log)
 		if err != nil || u == nil {
 			w.Header().Set("Content-Type", "application/json")
 			http.Error(w, `{"error":"unauthenticated"}`, http.StatusUnauthorized)

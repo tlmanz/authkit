@@ -1,3 +1,10 @@
+[![CI](https://github.com/tlmanz/authkit/actions/workflows/ci.yml/badge.svg)](https://github.com/tlmanz/authkit/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/tlmanz/authkit/actions/workflows/codequality.yml/badge.svg)](https://github.com/tlmanz/authkit/actions/workflows/codequality.yml)
+[![Coverage Status](https://coveralls.io/repos/github/tlmanz/authkit/badge.svg)](https://coveralls.io/github/tlmanz/authkit)
+![Open Issues](https://img.shields.io/github/issues/tlmanz/authkit)
+[![Go Report Card](https://goreportcard.com/badge/github.com/tlmanz/authkit)](https://goreportcard.com/report/github.com/tlmanz/authkit)
+![GitHub release (latest by date)](https://img.shields.io/github/v/release/tlmanz/authkit)
+
 # authkit
 
 Plug-and-play authentication with YAML-based RBAC for Small Go HTTP services.
@@ -10,6 +17,7 @@ Plug-and-play authentication with YAML-based RBAC for Small Go HTTP services.
 - Live policy reload without restarts (`WatchRBAC`)
 - Works with Go 1.22+ stdlib `net/http` (no external router required)
 - Storage-agnostic — implement a 2-method interface for your database
+- Pluggable logger — bring your own (`slog`, `zap`, `zerolog`) or use the default
 
 ---
 
@@ -177,6 +185,58 @@ hashed, err := authkit.HashPassword("user-password")
   ```go
   mux.Handle("POST /auth/login", rateLimiter(http.HandlerFunc(auth.Login)))
   ```
+
+---
+
+## Custom Logger
+
+By default, authkit logs to Go's standard `log` package. You can plug in your own logger by implementing the `Logger` interface:
+
+```go
+type Logger interface {
+    Info(msg string, args ...any)
+    Error(msg string, args ...any)
+}
+```
+
+### Using the default logger
+
+```go
+// No Logger field needed — uses standard log package automatically.
+auth, err := authkit.New(authkit.Config{...})
+```
+
+### Using slog
+
+```go
+type slogAdapter struct {
+    l *slog.Logger
+}
+
+func (s slogAdapter) Info(msg string, args ...any)  { s.l.Info(fmt.Sprintf(msg, args...)) }
+func (s slogAdapter) Error(msg string, args ...any) { s.l.Error(fmt.Sprintf(msg, args...)) }
+
+auth, err := authkit.New(authkit.Config{
+    Logger: slogAdapter{l: slog.Default()},
+    // ...
+})
+```
+
+### Using zap
+
+```go
+type zapAdapter struct {
+    l *zap.SugaredLogger
+}
+
+func (z zapAdapter) Info(msg string, args ...any)  { z.l.Infof(msg, args...) }
+func (z zapAdapter) Error(msg string, args ...any) { z.l.Errorf(msg, args...) }
+
+auth, err := authkit.New(authkit.Config{
+    Logger: zapAdapter{l: zapLogger.Sugar()},
+    // ...
+})
+```
 
 ---
 
@@ -402,6 +462,9 @@ authkit.Config{
 
     // Optional: password validation rules. Default: min 8 characters.
     PasswordPolicy: &authkit.PasswordPolicy{MinLength: 12},
+
+    // Optional: custom logger. Default: standard log package.
+    Logger: myLogger, // implements authkit.Logger
 }
 ```
 
