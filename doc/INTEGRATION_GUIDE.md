@@ -171,27 +171,38 @@ Create a `policy.yaml` file. This controls who has which permissions.
 ```yaml
 roles:
   admin:
-    permissions: ["*"]
+    permissions: ["*"]           # wildcard — passes every permission check
     members:
       - alice@company.com
 
-  developer:
-    permissions: ["view", "upload"]
+  editor:
+    permissions: ["posts:write", "posts:publish", "media:upload"]
     members:
       - bob@company.com
       - carol@company.com
 
-  viewer:
-    permissions: ["view"]
+  reader:
+    permissions: ["posts:read"]  # no members — used as default_role below
 
-default_role: viewer
+default_role: reader
 ```
+
+**Permissions are fully user-defined.** Choose names that match your application's domain. Common naming conventions:
+
+| Style | Example |
+|-------|---------|
+| Simple verbs | `"read"`, `"write"`, `"delete"` |
+| Namespaced | `"posts:read"`, `"posts:write"`, `"posts:publish"` |
+| Dot-separated | `"reports.view"`, `"reports.export"` |
+| Action-resource | `"create-project"`, `"delete-user"` |
+
+The only built-in constant is `authkit.PermAll = "*"` — a wildcard that passes every `Can()` check. All other permission strings are yours to define.
 
 **Rules:**
 - Role names must be alphanumeric with hyphens or underscores (e.g., `admin`, `power-user`, `team_lead`)
-- Permission names must be alphanumeric with dots, colons, hyphens, or underscores (e.g., `view`, `reports:export`, `deploy.production`)
-- Use `"*"` to grant all permissions (superuser)
-- `default_role` is optional — it is the fallback role for authenticated users whose email is not listed. If omitted, unlisted users get no role and no permissions.
+- Permission names must be alphanumeric with dots, colons, hyphens, or underscores, or `"*"`
+- Permission strings are matched exactly — `"posts"` does not grant `"posts:read"`
+- `default_role` is optional — fallback for authenticated users not listed under any role. Omit to deny access to unlisted users entirely.
 - Members are matched case-insensitively
 
 ### Step 4: Generate a session secret
@@ -292,7 +303,7 @@ func main() {
 
     // Protected routes
     mux.Handle("GET /api/data", auth.RequireAuth(http.HandlerFunc(dataHandler)))
-    mux.Handle("POST /api/admin", auth.Require(authkit.PermManage)(http.HandlerFunc(adminHandler)))
+    mux.Handle("POST /api/admin", auth.Require("admin:write")(http.HandlerFunc(adminHandler)))
 
     log.Println("listening on :8080")
     log.Fatal(http.ListenAndServe(":8080", mux))
@@ -622,16 +633,15 @@ var ErrUserExists   = errors.New("authkit: user already exists")
 var ErrUserNotFound = errors.New("authkit: user not found")
 ```
 
-### Built-in permission constants
+### Permission constants
 
 ```go
 const (
-    PermView   = "view"   // read-only access
-    PermUpload = "upload" // upload / trigger actions
-    PermManage = "manage" // create / update / delete
-    PermAll    = "*"      // wildcard — passes every permission check
+    PermAll = "*" // wildcard — passes every permission check
 )
 ```
+
+Permissions are fully user-defined strings. `PermAll` is the only constant authkit provides — all other permission names are defined by you in `policy.yaml` and matched exactly in code. See the [Permissions](#permissions) section for naming conventions.
 
 ---
 

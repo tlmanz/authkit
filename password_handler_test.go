@@ -244,7 +244,7 @@ func TestRegister_RBACRoleAssigned(t *testing.T) {
 	if u.Role != "admin" {
 		t.Errorf("role: got %q, want admin", u.Role)
 	}
-	if !u.Can(PermManage) {
+	if !u.Can("manage") {
 		t.Error("admin should have manage permission")
 	}
 }

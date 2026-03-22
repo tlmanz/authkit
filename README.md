@@ -124,7 +124,7 @@ mux.HandleFunc("GET /auth/me",      auth.Me)
 
 // Protected routes
 mux.Handle("GET /api/reports",   auth.RequireAuth(http.HandlerFunc(reportsHandler)))
-mux.Handle("POST /api/projects", auth.Require(authkit.PermManage)(http.HandlerFunc(createHandler)))
+mux.Handle("POST /api/projects", auth.Require("projects:write")(http.HandlerFunc(createHandler)))
 ```
 
 ---
@@ -359,7 +359,7 @@ Works identically for OAuth and password-authenticated users.
 ### `Require(permission)` — enforce a permission
 
 ```go
-mux.Handle("POST /api/projects", auth.Require(authkit.PermManage)(http.HandlerFunc(handler)))
+mux.Handle("POST /api/projects", auth.Require("projects:write")(http.HandlerFunc(handler)))
 ```
 
 Returns `401` for missing session, `403 Forbidden` when the user lacks the permission.
@@ -378,31 +378,57 @@ func reportsHandler(w http.ResponseWriter, r *http.Request) {
 
 ## Permissions
 
-Built-in permission constants:
+Permissions are **fully user-defined strings** — authkit does not prescribe any specific set. You define them in `policy.yaml` and enforce them in code.
 
-| Constant | Value | Intended use |
-|----------|-------|-------------|
-| `authkit.PermView` | `"view"` | Read-only access |
-| `authkit.PermUpload` | `"upload"` | Upload / trigger actions |
-| `authkit.PermManage` | `"manage"` | Create / update / delete |
-| `authkit.PermAll` | `"*"` | Wildcard — grants every check |
+The only built-in constant is `authkit.PermAll = "*"`, which is a wildcard that passes every permission check.
 
-You can define your own permission strings in the YAML and check them with `Require` or `User.Can`:
+### Define permissions in policy.yaml
+
+```yaml
+roles:
+  admin:
+    permissions: ["*"]          # wildcard — passes every check
+
+  editor:
+    permissions: ["posts:write", "posts:publish", "media:upload"]
+
+  reader:
+    permissions: ["posts:read"]
+```
+
+### Enforce on a route
 
 ```go
-// Custom permission string in policy.yaml: ["view", "upload", "deploy"]
-mux.Handle("POST /deploy", auth.Require("deploy")(deployHandler))
+mux.Handle("POST /posts",         auth.Require("posts:write")(http.HandlerFunc(createPost)))
+mux.Handle("POST /posts/publish", auth.Require("posts:publish")(http.HandlerFunc(publishPost)))
+mux.Handle("POST /media",         auth.Require("media:upload")(http.HandlerFunc(uploadMedia)))
+```
 
-// Or check inline:
+### Check inline in a handler
+
+```go
 func handler(w http.ResponseWriter, r *http.Request) {
     u := authkit.UserFromCtx(r.Context())
-    if !u.Can("deploy") {
+    if !u.Can("posts:publish") {
         http.Error(w, "forbidden", http.StatusForbidden)
         return
     }
     // ...
 }
 ```
+
+### Permission string format
+
+Any alphanumeric string with `.` `:` `-` `_` is valid. Common conventions:
+
+| Style | Example |
+|-------|---------|
+| Simple | `"read"`, `"write"`, `"delete"` |
+| Namespaced | `"posts:read"`, `"posts:write"` |
+| Dot-separated | `"reports.view"`, `"reports.export"` |
+| Action-resource | `"create-project"`, `"delete-user"` |
+
+There is no hierarchy — `"posts:read"` does not automatically grant `"posts"`. Each string is matched exactly.
 
 ---
 

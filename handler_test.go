@@ -129,7 +129,7 @@ func TestLogout_RedirectsToAfterLogoutURL(t *testing.T) {
 func TestLogout_ClearsSession(t *testing.T) {
 	secret := "test-secret-that-is-32-bytes-ok!"
 	store := newCookieStore(secret, false)
-	u := &User{Email: "alice@example.com", permissions: []string{PermView}}
+	u := &User{Email: "alice@example.com", permissions: []string{"view"}}
 
 	// Save a session.
 	w1 := httptest.NewRecorder()

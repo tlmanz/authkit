@@ -78,7 +78,7 @@ func TestRequireAuth_ValidSession_CallsNext(t *testing.T) {
 }
 
 func TestRequireAuth_InjectsUserIntoContext(t *testing.T) {
-	u := &User{Email: "ctx@example.com", Role: "viewer", permissions: []string{PermView}}
+	u := &User{Email: "ctx@example.com", Role: "viewer", permissions: []string{"view"}}
 	a, cookies := buildAuthWithSession(t, u)
 
 	var fromCtx *User
@@ -105,7 +105,7 @@ func TestRequire_NoSession_Returns401(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodGet, "/", nil)
-	a.Require(PermView)(sentinelHandler(&called, &captured)).ServeHTTP(w, r)
+	a.Require("view")(sentinelHandler(&called, &captured)).ServeHTTP(w, r)
 
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("status: got %d, want %d", w.Code, http.StatusUnauthorized)
@@ -116,13 +116,13 @@ func TestRequire_NoSession_Returns401(t *testing.T) {
 }
 
 func TestRequire_InsufficientPermission_Returns403(t *testing.T) {
-	u := &User{Email: "viewer@example.com", Role: "viewer", permissions: []string{PermView}}
+	u := &User{Email: "viewer@example.com", Role: "viewer", permissions: []string{"view"}}
 	a, cookies := buildAuthWithSession(t, u)
 
 	called := false
 	var captured *User
 	w := httptest.NewRecorder()
-	a.Require(PermManage)(sentinelHandler(&called, &captured)).ServeHTTP(w, requestWithCookies(cookies))
+	a.Require("manage")(sentinelHandler(&called, &captured)).ServeHTTP(w, requestWithCookies(cookies))
 
 	if w.Code != http.StatusForbidden {
 		t.Errorf("status: got %d, want %d", w.Code, http.StatusForbidden)
@@ -133,13 +133,13 @@ func TestRequire_InsufficientPermission_Returns403(t *testing.T) {
 }
 
 func TestRequire_SufficientPermission_CallsNext(t *testing.T) {
-	u := &User{Email: "dev@example.com", Role: "developer", permissions: []string{PermView, PermUpload}}
+	u := &User{Email: "dev@example.com", Role: "developer", permissions: []string{"view", "upload"}}
 	a, cookies := buildAuthWithSession(t, u)
 
 	called := false
 	var captured *User
 	w := httptest.NewRecorder()
-	a.Require(PermUpload)(sentinelHandler(&called, &captured)).ServeHTTP(w, requestWithCookies(cookies))
+	a.Require("upload")(sentinelHandler(&called, &captured)).ServeHTTP(w, requestWithCookies(cookies))
 
 	if w.Code != http.StatusOK {
 		t.Errorf("status: got %d, want %d", w.Code, http.StatusOK)
@@ -156,7 +156,7 @@ func TestRequire_WildcardPermission_PassesAllChecks(t *testing.T) {
 	u := &User{Email: "admin@example.com", Role: "admin", permissions: []string{PermAll}}
 	a, cookies := buildAuthWithSession(t, u)
 
-	for _, perm := range []string{PermView, PermUpload, PermManage, "custom.perm"} {
+	for _, perm := range []string{"view", "upload", "manage", "custom.perm"} {
 		called := false
 		var captured *User
 		w := httptest.NewRecorder()
@@ -187,7 +187,7 @@ func TestRequire_CustomPermission(t *testing.T) {
 	// Should fail "manage".
 	called = false
 	w = httptest.NewRecorder()
-	a.Require(PermManage)(sentinelHandler(&called, &captured)).ServeHTTP(w, requestWithCookies(cookies))
+	a.Require("manage")(sentinelHandler(&called, &captured)).ServeHTTP(w, requestWithCookies(cookies))
 	if w.Code != http.StatusForbidden || called {
 		t.Errorf("custom perm 'manage': got status %d called=%v", w.Code, called)
 	}

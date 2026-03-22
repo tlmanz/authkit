@@ -62,7 +62,7 @@ func TestSessionRoundTrip(t *testing.T) {
 
 func TestSessionPermissionsRoundTrip(t *testing.T) {
 	store := newCookieStore("this-secret-is-exactly-32-bytes!!", false)
-	want := []string{PermView, PermUpload, PermManage}
+	want := []string{"view", "upload", "manage"}
 	u := &User{Email: "dev@example.com", permissions: want}
 
 	w := httptest.NewRecorder()
@@ -99,7 +99,7 @@ func TestUserFromSession_NoCookie(t *testing.T) {
 
 func TestClearSession_SetsExpiredCookie(t *testing.T) {
 	store := newCookieStore("this-secret-is-exactly-32-bytes!!", false)
-	u := &User{Email: "eve@example.com", permissions: []string{PermView}}
+	u := &User{Email: "eve@example.com", permissions: []string{"view"}}
 
 	// Save — produces the auth cookie.
 	w1 := httptest.NewRecorder()

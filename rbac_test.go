@@ -72,8 +72,8 @@ func TestRoleFor_UnknownUserFallsBackToDefaultRole(t *testing.T) {
 	if role != "viewer" {
 		t.Errorf("unknown user: role = %q, want viewer", role)
 	}
-	if len(perms) != 1 || perms[0] != PermView {
-		t.Errorf("unknown user: perms = %v, want [%q]", perms, PermView)
+	if len(perms) != 1 || perms[0] != "view" {
+		t.Errorf("unknown user: perms = %v, want [%q]", perms, "view")
 	}
 }
 
@@ -101,8 +101,8 @@ roles:
 
 func TestUserCan(t *testing.T) {
 	adminUser := &User{permissions: []string{PermAll}}
-	devUser := &User{permissions: []string{PermView, PermUpload}}
-	viewerUser := &User{permissions: []string{PermView}}
+	devUser := &User{permissions: []string{"view", "upload"}}
+	viewerUser := &User{permissions: []string{"view"}}
 	var nilUser *User
 
 	tests := []struct {
@@ -111,15 +111,15 @@ func TestUserCan(t *testing.T) {
 		permission string
 		want       bool
 	}{
-		{"admin can view", adminUser, PermView, true},
-		{"admin can upload", adminUser, PermUpload, true},
-		{"admin can manage", adminUser, PermManage, true},
-		{"dev can view", devUser, PermView, true},
-		{"dev can upload", devUser, PermUpload, true},
-		{"dev cannot manage", devUser, PermManage, false},
-		{"viewer can view", viewerUser, PermView, true},
-		{"viewer cannot upload", viewerUser, PermUpload, false},
-		{"nil user returns false", nilUser, PermView, false},
+		{"admin can view", adminUser, "view", true},
+		{"admin can upload", adminUser, "upload", true},
+		{"admin can manage", adminUser, "manage", true},
+		{"dev can view", devUser, "view", true},
+		{"dev can upload", devUser, "upload", true},
+		{"dev cannot manage", devUser, "manage", false},
+		{"viewer can view", viewerUser, "view", true},
+		{"viewer cannot upload", viewerUser, "upload", false},
+		{"nil user returns false", nilUser, "view", false},
 	}
 
 	for _, tt := range tests {

@@ -20,7 +20,7 @@
 //
 //	// Protected routes
 //	mux.Handle("GET /api/reports", auth.RequireAuth(reportsHandler))
-//	mux.Handle("POST /api/projects", auth.Require(authkit.PermManage)(createHandler))
+//	mux.Handle("POST /api/projects", auth.Require("projects:write")(createHandler))
 package authkit
 
 import (

@@ -44,20 +44,11 @@ type RolePolicy struct {
 	Members []string `yaml:"members"`
 }
 
-// ── Built-in permission constants ─────────────────────────────────────────────
+// ── Permission constants ───────────────────────────────────────────────────────
 
 const (
-	// PermView allows read-only access (listing environments, projects, reports).
-	PermView = "view"
-
-	// PermUpload allows uploading test results and triggering report generation.
-	PermUpload = "upload"
-
-	// PermManage allows creating, updating, and deleting environments, projects,
-	// and reports.
-	PermManage = "manage"
-
-	// PermAll grants every permission. Equivalent to "*" in the YAML file.
+	// PermAll grants every permission check. Use "*" in policy.yaml to assign
+	// it to a role. All other permission strings are user-defined.
 	PermAll = "*"
 )
 
