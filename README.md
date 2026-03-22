@@ -11,6 +11,7 @@ Plug-and-play authentication with YAML-based RBAC for Small Go HTTP services.
 
 - **OAuth 2.0** via [markbates/goth](https://github.com/markbates/goth) — supports **GitHub**, **Google**, **GitLab** out of the box
 - **Email/password** authentication with bcrypt hashing
+- **API key authentication** — plug in any key store via a single-method interface
 - **Three modes**: OAuth only, password only, or both simultaneously
 - Encrypted cookie sessions via [gorilla/sessions](https://github.com/gorilla/sessions)
 - Role-Based Access Control defined in a single YAML file
@@ -345,24 +346,44 @@ For password-auth users, `provider` will be `"password"` and `avatarUrl` will be
 
 ## Middleware
 
-### `RequireAuth` — enforce a valid session
+### `RequireAuth` — enforce authentication (session or API key)
 
 ```go
 mux.Handle("GET /api/reports", auth.RequireAuth(http.HandlerFunc(reportsHandler)))
 ```
 
-Returns `401 Unauthenticated` if there is no valid session. On success the current
+Returns `401 Unauthenticated` if there is no valid credential. On success the current
 `*authkit.User` is available via `authkit.UserFromCtx(r.Context())`.
 
-Works identically for OAuth and password-authenticated users.
+Accepts API keys when `APIKeyValidator` is configured. Works identically for OAuth,
+password-authenticated, and API key users.
 
-### `Require(permission)` — enforce a permission
+### `Require(permission)` — enforce authentication + permission (session or API key)
 
 ```go
-mux.Handle("POST /api/projects", auth.Require("projects:write")(http.HandlerFunc(handler)))
+mux.Handle("POST /api/upload", auth.Require("upload")(http.HandlerFunc(handler)))
 ```
 
-Returns `401` for missing session, `403 Forbidden` when the user lacks the permission.
+Returns `401` for missing credential, `403 Forbidden` when the user lacks the permission.
+API keys are accepted when `APIKeyValidator` is configured.
+
+### `RequireSessionAuth` — enforce a valid session (rejects API keys)
+
+```go
+mux.Handle("GET /auth/me", auth.RequireSessionAuth(http.HandlerFunc(meHandler)))
+```
+
+Same as `RequireAuth` but API key credentials are rejected even if `APIKeyValidator` is set.
+Use this for UI-only routes that should never be accessible from automated clients.
+
+### `RequireSession(permission)` — enforce session + permission (rejects API keys)
+
+```go
+mux.Handle("DELETE /api/environments/{id}", auth.RequireSession("manage")(http.HandlerFunc(handler)))
+```
+
+Same as `Require` but API keys are always rejected. Use this for management routes that
+must only be operated by a logged-in human.
 
 ### Reading the current user inside a handler
 
@@ -370,9 +391,86 @@ Returns `401` for missing session, `403 Forbidden` when the user lacks the permi
 func reportsHandler(w http.ResponseWriter, r *http.Request) {
     u := authkit.UserFromCtx(r.Context())
     // u is always non-nil here because RequireAuth ran first.
+    // Works for OAuth, password, and API key users.
     fmt.Fprintf(w, "Hello, %s (%s)", u.Name, u.Role)
 }
 ```
+
+---
+
+## API Key Authentication
+
+For programmatic access (CI/CD pipelines, scripts, service-to-service calls) authkit can validate API keys alongside OAuth/password sessions. Implement the `APIKeyValidator` interface and pass it to `Config`:
+
+```go
+type APIKeyValidator interface {
+    ValidateKey(ctx context.Context, rawKey string) (*User, error)
+}
+```
+
+Return `nil, nil` when the key is not found, inactive, or expired. Return `nil, err` only for unexpected infrastructure failures (e.g. a database connection error).
+
+### Wiring it up
+
+```go
+auth, err := authkit.New(authkit.Config{
+    // ... other fields ...
+    APIKeyValidator: myKeyStore, // implements authkit.APIKeyValidator
+})
+```
+
+### How it works
+
+When `APIKeyValidator` is set, the middleware checks the `Authorization: Bearer <key>` header (or `X-API-Key: <key>` as a fallback) **before** the session cookie on every request. On a valid key:
+
+1. `ValidateKey` returns a `*User` with `Email`, `Name`, `Provider`, and `Role` populated.
+2. Authkit resolves `permissions` from the RBAC policy based on the returned `Role`.
+3. The user is injected into the request context under the **same key** as session users — `UserFromCtx` works transparently for both.
+
+### Middleware variants
+
+| Middleware | API keys | Sessions | Use for |
+|---|---|---|---|
+| `auth.RequireAuth(next)` | ✓ | ✓ | General protected routes |
+| `auth.Require(perm)(next)` | ✓ | ✓ | Permission-gated routes open to CI/CD |
+| `auth.RequireSessionAuth(next)` | ✗ | ✓ | UI-only routes (e.g. `/auth/me`) |
+| `auth.RequireSession(perm)(next)` | ✗ | ✓ | Management routes that must not accept keys |
+
+```go
+mux.Handle("GET /api/reports",   auth.Require("view")(reportsHandler))   // API keys OK
+mux.Handle("POST /api/projects", auth.RequireSession("manage")(createH)) // session only
+mux.Handle("GET /auth/me",       auth.RequireSessionAuth(meHandler))     // session only
+```
+
+### Example implementation
+
+A minimal DB-backed key store:
+
+```go
+type KeyStore struct{ db *sql.DB }
+
+func (s *KeyStore) ValidateKey(ctx context.Context, rawKey string) (*authkit.User, error) {
+    hash := sha256Hex(rawKey)
+    var name, role string
+    err := s.db.QueryRowContext(ctx,
+        "SELECT name, role FROM api_keys WHERE key_hash = ? AND is_active = 1", hash,
+    ).Scan(&name, &role)
+    if errors.Is(err, sql.ErrNoRows) {
+        return nil, nil
+    }
+    if err != nil {
+        return nil, err
+    }
+    return &authkit.User{
+        Email:    "apikey:" + name,
+        Name:     name,
+        Provider: "apikey",
+        Role:     role,
+    }, nil
+}
+```
+
+The returned `User.Role` must match a role defined in `policy.yaml` for permissions to be resolved. If the role is not found in the policy the user is authenticated but has no permissions.
 
 ---
 
@@ -509,6 +607,11 @@ authkit.Config{
 
     // Optional: custom logger. Default: standard log package.
     Logger: myLogger, // implements authkit.Logger
+
+    // Optional: enables API key authentication alongside sessions.
+    // When set, Require/RequireAuth accept Bearer tokens validated by this.
+    // RequireSession/RequireSessionAuth always reject API keys regardless.
+    APIKeyValidator: myKeyStore, // implements authkit.APIKeyValidator
 }
 ```
 

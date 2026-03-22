@@ -101,6 +101,20 @@ func (r *rbac) roleFor(email string) (role string, permissions []string) {
 	return role, def.Permissions
 }
 
+// permissionsForRole returns a copy of the permission slice for the named role.
+// Returns nil if the role is not defined in the current policy.
+func (r *rbac) permissionsForRole(role string) []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	def, ok := r.policy.Roles[role]
+	if !ok {
+		return nil
+	}
+	perms := make([]string, len(def.Permissions))
+	copy(perms, def.Permissions)
+	return perms
+}
+
 // ── YAML loader ───────────────────────────────────────────────────────────────
 
 // loadRBAC reads and parses the YAML policy file. If FilePath is empty the

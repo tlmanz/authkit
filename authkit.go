@@ -35,6 +35,17 @@ import (
 	"github.com/markbates/goth/gothic"
 )
 
+// APIKeyValidator validates a raw API key string and returns the associated
+// user. Implementations look up the key hash in a store and return a *User
+// with Email, Name, Provider, and Role populated. Authkit then resolves the
+// user's permissions from the RBAC policy based on the returned Role.
+//
+// Return nil, nil when the key is not found, expired, or inactive.
+// Return nil, err only for unexpected infrastructure failures.
+type APIKeyValidator interface {
+	ValidateKey(ctx context.Context, rawKey string) (*User, error)
+}
+
 // AuthMode controls which authentication methods are enabled.
 type AuthMode string
 
@@ -96,15 +107,23 @@ type Config struct {
 	// Logger is used for diagnostic output. If nil, logs are written to the
 	// standard library log package.
 	Logger Logger
+
+	// APIKeyValidator enables API key authentication alongside OAuth sessions.
+	// When set, Require and RequireAuth middleware check the Authorization:
+	// Bearer (or X-API-Key) header first. RequireSession and RequireSessionAuth
+	// skip API key auth entirely (session-only routes).
+	// If nil, API key auth is disabled and only sessions are accepted.
+	APIKeyValidator APIKeyValidator
 }
 
 // Auth is the central object. Create one with New() and attach its methods as
 // HTTP handlers and middleware.
 type Auth struct {
-	cfg   Config
-	store sessions.Store
-	rbac  *rbac
-	log   Logger
+	cfg          Config
+	store        sessions.Store
+	rbac         *rbac
+	log          Logger
+	keyValidator APIKeyValidator
 }
 
 // New validates the config, registers the OAuth providers with goth, loads the
@@ -186,7 +205,7 @@ func New(cfg Config) (*Auth, error) {
 		return nil, fmt.Errorf("authkit: load RBAC policy: %w", err)
 	}
 
-	return &Auth{cfg: cfg, store: store, rbac: r, log: cfg.Logger}, nil
+	return &Auth{cfg: cfg, store: store, rbac: r, log: cfg.Logger, keyValidator: cfg.APIKeyValidator}, nil
 }
 
 // WatchRBAC starts a background goroutine that reloads the RBAC policy file
