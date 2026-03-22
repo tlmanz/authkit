@@ -206,16 +206,36 @@ Store this as an environment variable. Never hardcode it.
 
 For each provider you want to support:
 
-**GitHub:** Go to https://github.com/settings/developers > New OAuth App
-- Callback URL: `https://your-domain.com/auth/github/callback`
+**GitHub**
 
-**Google:** Go to Google Cloud Console > APIs & Services > Credentials > Create OAuth Client
-- Callback URL: `https://your-domain.com/auth/google/callback`
+1. Go to [github.com/settings/developers](https://github.com/settings/developers) → New OAuth App
+2. Set **Authorization callback URL** to:
+   - Production: `https://your-domain.com/auth/github/callback`
+   - Local dev: `http://localhost:8080/auth/github/callback`
+3. Copy the **Client ID** and generate a **Client Secret**
 
-**GitLab:** Go to GitLab > Preferences > Applications
-- Callback URL: `https://your-domain.com/auth/gitlab/callback`
+**Google**
 
-Store client IDs and secrets as environment variables.
+1. Go to Google Cloud Console → APIs & Services → Credentials → Create OAuth Client ID
+2. Choose application type: **Web application**
+3. Under **Authorized redirect URIs**, add:
+   - Production: `https://your-domain.com/auth/google/callback`
+   - Local dev: `http://localhost:8080/auth/google/callback`
+4. Google allows multiple URIs per client — add both at once
+5. Copy the **Client ID** and **Client Secret**
+
+**GitLab**
+
+1. Go to GitLab → User Settings → Applications (or group/admin Applications for shared apps)
+2. Set **Redirect URI** to:
+   - Production: `https://your-domain.com/auth/gitlab/callback`
+   - Local dev: `http://localhost:8080/auth/gitlab/callback`
+3. Enable scope: `read_user`
+4. Copy the **Application ID** (this is the Client ID) and **Secret**
+
+> The callback URL pattern is always `{CallbackBaseURL}/auth/{provider}/callback`. If you change `CallbackBaseURL` in your config, update the registered URL in the provider console to match.
+
+Store client IDs and secrets as environment variables — never hardcode them in source.
 
 ### Step 6: Initialize authkit and register routes
 

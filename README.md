@@ -253,7 +253,12 @@ authkit.ProviderConfig{
 }
 ```
 
-Callback URL to register in GitHub: `https://example.com/auth/github/callback`
+**Where to register:** [github.com/settings/developers](https://github.com/settings/developers) → New OAuth App
+
+| Field | Value |
+|-------|-------|
+| Authorization callback URL | `https://example.com/auth/github/callback` |
+| Authorization callback URL (local dev) | `http://localhost:8080/auth/github/callback` |
 
 ### Google
 
@@ -266,7 +271,14 @@ authkit.ProviderConfig{
 }
 ```
 
-Callback URL to register in Google Cloud Console: `https://example.com/auth/google/callback`
+**Where to register:** Google Cloud Console → APIs & Services → Credentials → Create OAuth Client ID (type: Web application)
+
+| Field | Value |
+|-------|-------|
+| Authorized redirect URIs | `https://example.com/auth/google/callback` |
+| Authorized redirect URIs (local dev) | `http://localhost:8080/auth/google/callback` |
+
+> Google allows multiple redirect URIs per client — add both production and localhost entries.
 
 ### GitLab
 
@@ -279,7 +291,13 @@ authkit.ProviderConfig{
 }
 ```
 
-Callback URL to register in GitLab: `https://example.com/auth/gitlab/callback`
+**Where to register:** GitLab → User Settings → Applications (or group/admin Applications for shared apps)
+
+| Field | Value |
+|-------|-------|
+| Redirect URI | `https://example.com/auth/gitlab/callback` |
+| Redirect URI (local dev) | `http://localhost:8080/auth/gitlab/callback` |
+| Scopes to enable | `read_user` |
 
 ### Multiple providers at once
 
