@@ -50,7 +50,7 @@ func (a *Auth) Register(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Auto-login: resolve RBAC role and create session.
-	role, permissions := a.rbac.roleFor(email)
+	role, permissions := a.rbacProvider.RoleFor(r.Context(), email)
 	u := &User{
 		Email:       email,
 		Name:        name,
@@ -95,7 +95,7 @@ func (a *Auth) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	role, permissions := a.rbac.roleFor(email)
+	role, permissions := a.rbacProvider.RoleFor(r.Context(), email)
 	u := &User{
 		Email:       email,
 		Name:        storedUser.Name,

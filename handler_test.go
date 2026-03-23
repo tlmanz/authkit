@@ -61,7 +61,7 @@ func TestMe_WithContext_ReturnsUser(t *testing.T) {
 	}
 	a := &Auth{
 		store: newCookieStore("test-secret-that-is-32-bytes-ok!", false),
-		rbac:  &rbac{},
+		rbacProvider:  &rbac{},
 		log:   defaultLogger{},
 	}
 
@@ -86,7 +86,7 @@ func TestMe_WithContext_ReturnsUser(t *testing.T) {
 func TestMe_NoSession_Returns401(t *testing.T) {
 	a := &Auth{
 		store: newCookieStore("test-secret-that-is-32-bytes-ok!", false),
-		rbac:  &rbac{},
+		rbacProvider:  &rbac{},
 		log:   defaultLogger{},
 	}
 
@@ -110,7 +110,7 @@ func TestLogout_RedirectsToAfterLogoutURL(t *testing.T) {
 	a := &Auth{
 		store: newCookieStore("test-secret-that-is-32-bytes-ok!", false),
 		cfg:   Config{AfterLogoutURL: "/goodbye"},
-		rbac:  &rbac{},
+		rbacProvider:  &rbac{},
 		log:   defaultLogger{},
 	}
 

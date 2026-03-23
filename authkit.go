@@ -121,7 +121,7 @@ type Config struct {
 type Auth struct {
 	cfg          Config
 	store        sessions.Store
-	rbac         *rbac
+	rbacProvider PolicyProvider
 	log          Logger
 	keyValidator APIKeyValidator
 }
@@ -200,12 +200,12 @@ func New(cfg Config) (*Auth, error) {
 	}
 
 	// RBAC policy.
-	r, err := loadRBAC(cfg.RBAC)
+	provider, err := resolveProvider(cfg.RBAC)
 	if err != nil {
 		return nil, fmt.Errorf("authkit: load RBAC policy: %w", err)
 	}
 
-	return &Auth{cfg: cfg, store: store, rbac: r, log: cfg.Logger, keyValidator: cfg.APIKeyValidator}, nil
+	return &Auth{cfg: cfg, store: store, rbacProvider: provider, log: cfg.Logger, keyValidator: cfg.APIKeyValidator}, nil
 }
 
 // WatchRBAC starts a background goroutine that reloads the RBAC policy file
@@ -216,6 +216,11 @@ func New(cfg Config) (*Auth, error) {
 //
 //	go auth.WatchRBAC(ctx, 30*time.Second)
 func (a *Auth) WatchRBAC(ctx context.Context, interval time.Duration) {
+	reloader, ok := a.rbacProvider.(PolicyReloader)
+	if !ok {
+		a.log.Info("authkit: WatchRBAC: provider does not implement PolicyReloader — live reloading is disabled")
+		return
+	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -223,12 +228,10 @@ func (a *Auth) WatchRBAC(ctx context.Context, interval time.Duration) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			r, err := loadRBAC(a.cfg.RBAC)
-			if err != nil {
+			if err := reloader.Reload(); err != nil {
 				// Keep the old policy on error — don't lock users out.
-				continue
+				a.log.Error("authkit: RBAC reload failed: %v", err)
 			}
-			a.rbac = r
 		}
 	}
 }

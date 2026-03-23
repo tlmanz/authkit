@@ -20,7 +20,7 @@ func sentinelHandler(called *bool, captured **User) http.Handler {
 func buildAuthWithSession(t *testing.T, u *User) (*Auth, []*http.Cookie) {
 	t.Helper()
 	store := newCookieStore("middleware-test-secret-32-bytes!!", false)
-	a := &Auth{store: store, rbac: &rbac{}}
+	a := &Auth{store: store, rbacProvider: &rbac{}}
 
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodGet, "/", nil)

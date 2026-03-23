@@ -34,7 +34,7 @@ func (a *Auth) tryAPIKeyAuth(r *http.Request) *User {
 		return nil
 	}
 	// Resolve RBAC permissions for the role assigned to this API key.
-	u.permissions = a.rbac.permissionsForRole(u.Role)
+	u.permissions = a.rbacProvider.PermissionsForRole(u.Role)
 	return u
 }
 

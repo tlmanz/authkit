@@ -14,7 +14,8 @@ Plug-and-play authentication with YAML-based RBAC for Small Go HTTP services.
 - **API key authentication** — plug in any key store via a single-method interface
 - **Three modes**: OAuth only, password only, or both simultaneously
 - Encrypted cookie sessions via [gorilla/sessions](https://github.com/gorilla/sessions)
-- Role-Based Access Control defined in a single YAML file
+- Role-Based Access Control via YAML file or a pluggable `PolicyProvider` interface
+- **Layered RBAC** — seed roles from YAML, then let a UI override individual users via a database
 - Live policy reload without restarts (`WatchRBAC`)
 - Works with Go 1.22+ stdlib `net/http` (no external router required)
 - Storage-agnostic — implement a 2-method interface for your database
@@ -532,8 +533,7 @@ There is no hierarchy — `"posts:read"` does not automatically grant `"posts"`.
 
 ## Live Policy Reload
 
-`WatchRBAC` reloads the policy file on every tick. If the file is invalid the old
-policy is kept — users are never accidentally locked out.
+`WatchRBAC` reloads the policy on every tick. If the reload fails the old policy is kept — users are never accidentally locked out. Works with any `PolicyProvider` that implements `PolicyReloader` (both the built-in YAML provider and `LayeredPolicyProvider` support this).
 
 ```go
 ctx, cancel := context.WithCancel(context.Background())
@@ -543,7 +543,152 @@ defer cancel()
 go auth.WatchRBAC(ctx, 60*time.Second)
 ```
 
-To apply a change: edit `policy.yaml` and wait for the next tick. No restart needed.
+For the YAML-only provider: edit `policy.yaml` and wait for the next tick. No restart needed.
+
+For `LayeredPolicyProvider`: the YAML baseline is reloaded on each tick. Database overrides are always read live on each login request.
+
+If you supply a custom `PolicyProvider` that manages its own cache, simply do not implement `PolicyReloader` and `WatchRBAC` will exit immediately — your provider controls its own refresh strategy.
+
+---
+
+## Database-backed RBAC
+
+By default, roles are read from a YAML file. For applications that need a management UI where operators can change user roles at runtime without touching files, authkit provides two additional mechanisms.
+
+### Option 1: Layered provider (YAML baseline + database overrides)
+
+Roles and their initial members are defined in `policy.yaml` as usual. Any user whose role is changed through your UI writes to a `UserRoleStore` — authkit checks the store first, falling back to YAML for everyone else.
+
+**1. Implement `UserRoleStore`**
+
+```go
+type UserRoleStore interface {
+    GetOverride(ctx context.Context, email string) (role string, permissions []string, found bool, err error)
+    SetOverride(ctx context.Context, email, role string, permissions []string) error
+    DeleteOverride(ctx context.Context, email string) error
+}
+```
+
+A minimal Postgres implementation:
+
+```go
+type RoleStore struct{ db *sql.DB }
+
+func (s *RoleStore) GetOverride(ctx context.Context, email string) (string, []string, bool, error) {
+    var role, permsJSON string
+    err := s.db.QueryRowContext(ctx,
+        "SELECT role, permissions FROM role_overrides WHERE email = $1", email,
+    ).Scan(&role, &permsJSON)
+    if errors.Is(err, sql.ErrNoRows) {
+        return "", nil, false, nil
+    }
+    if err != nil {
+        return "", nil, false, err
+    }
+    var perms []string
+    json.Unmarshal([]byte(permsJSON), &perms)
+    return role, perms, true, nil
+}
+
+func (s *RoleStore) SetOverride(ctx context.Context, email, role string, permissions []string) error {
+    permsJSON, _ := json.Marshal(permissions)
+    _, err := s.db.ExecContext(ctx,
+        `INSERT INTO role_overrides (email, role, permissions)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (email) DO UPDATE SET role = $2, permissions = $3`,
+        email, role, string(permsJSON),
+    )
+    return err
+}
+
+func (s *RoleStore) DeleteOverride(ctx context.Context, email string) error {
+    _, err := s.db.ExecContext(ctx, "DELETE FROM role_overrides WHERE email = $1", email)
+    return err
+}
+```
+
+Required table:
+
+```sql
+CREATE TABLE role_overrides (
+    email       TEXT PRIMARY KEY,
+    role        TEXT NOT NULL,
+    permissions JSONB NOT NULL DEFAULT '[]'
+);
+```
+
+**2. Wire it up**
+
+```go
+roleStore := &RoleStore{db: db}
+
+provider, err := authkit.NewLayeredProvider("policy.yaml", roleStore,
+    authkit.WithLogger(myLogger), // optional: logs DB errors during role lookups
+)
+if err != nil {
+    log.Fatal(err)
+}
+
+auth, err := authkit.New(authkit.Config{
+    RBAC: authkit.RBACConfig{Provider: provider},
+    // ... rest of config
+})
+
+go auth.WatchRBAC(ctx, 30*time.Second) // reloads the YAML baseline
+```
+
+**3. Change a user's role from a management handler**
+
+Use `provider.SetOverride` — it validates the role name against the YAML policy and checks permission string format before writing to the store.
+
+```go
+func setRoleHandler(w http.ResponseWriter, r *http.Request) {
+    email := r.FormValue("email")
+    role  := r.FormValue("role")
+    perms := rolesMap[role] // your app's role→permissions lookup
+
+    if err := provider.SetOverride(r.Context(), email, role, perms); err != nil {
+        http.Error(w, err.Error(), http.StatusBadRequest)
+        return
+    }
+    // Change takes effect on the user's next login.
+}
+```
+
+> **Session note:** role changes take effect on the **next login** only. Existing sessions keep their current permissions until they expire (7 days by default) or the user logs out. If you need immediate enforcement for demotions, implement session invalidation at the application level.
+
+**4. Reset a user to the YAML baseline**
+
+```go
+provider.DeleteOverride(ctx, "bob@example.com")
+```
+
+### Option 2: Fully custom `PolicyProvider`
+
+If neither YAML nor the layered approach fits your needs, implement the `PolicyProvider` interface directly:
+
+```go
+type PolicyProvider interface {
+    RoleFor(ctx context.Context, email string) (role string, permissions []string)
+    PermissionsForRole(role string) []string
+}
+```
+
+Pass your implementation via `RBACConfig.Provider`:
+
+```go
+auth, err := authkit.New(authkit.Config{
+    RBAC: authkit.RBACConfig{Provider: myCustomProvider},
+})
+```
+
+Optionally implement `PolicyReloader` to participate in `WatchRBAC`:
+
+```go
+type PolicyReloader interface {
+    Reload() error
+}
+```
 
 ---
 
@@ -596,8 +741,13 @@ authkit.Config{
     // Optional: redirect target after logout. Default: "/"
     AfterLogoutURL: "/",
 
-    // Optional: RBAC policy. Leave FilePath empty to start with no policy.
+    // Optional: RBAC policy.
+    // YAML only (default):
     RBAC: authkit.RBACConfig{FilePath: "policy.yaml"},
+    // Layered (YAML baseline + database overrides):
+    // RBAC: authkit.RBACConfig{Provider: authkit.NewLayeredProvider("policy.yaml", store)},
+    // Fully custom:
+    // RBAC: authkit.RBACConfig{Provider: myProvider},
 
     // Required when password auth is enabled: storage backend.
     UserStore: myUserStore,

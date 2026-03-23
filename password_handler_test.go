@@ -66,7 +66,7 @@ func buildPasswordAuth(t *testing.T, store *mockUserStore) *Auth {
 			UserStore:     store,
 		},
 		store: newCookieStore(testSecret, false),
-		rbac:  newRBAC(Policy{}),
+		rbacProvider:  newRBAC(Policy{}),
 	}
 }
 
@@ -80,7 +80,7 @@ func buildPasswordAuthWithRBAC(t *testing.T, store *mockUserStore, policy Policy
 			UserStore:     store,
 		},
 		store: newCookieStore(testSecret, false),
-		rbac:  newRBAC(policy),
+		rbacProvider:  newRBAC(policy),
 	}
 }
 
@@ -468,7 +468,7 @@ func TestRegister_InternalStoreError(t *testing.T) {
 			UserStore:     failingUserStore{},
 		},
 		store: newCookieStore(testSecret, false),
-		rbac:  newRBAC(Policy{}),
+		rbacProvider:  newRBAC(Policy{}),
 		log:   defaultLogger{},
 	}
 
@@ -492,7 +492,7 @@ func TestLogin_InternalStoreError(t *testing.T) {
 			UserStore:     failingUserStore{},
 		},
 		store: newCookieStore(testSecret, false),
-		rbac:  newRBAC(Policy{}),
+		rbacProvider:  newRBAC(Policy{}),
 		log:   defaultLogger{},
 	}
 
@@ -518,7 +518,7 @@ func TestRegister_BothMode_Works(t *testing.T) {
 			UserStore:     newMockUserStore(),
 		},
 		store: newCookieStore(testSecret, false),
-		rbac:  newRBAC(Policy{}),
+		rbacProvider:  newRBAC(Policy{}),
 		log:   defaultLogger{},
 	}
 
@@ -550,7 +550,7 @@ func TestLogin_BothMode_Works(t *testing.T) {
 			UserStore:     store,
 		},
 		store: newCookieStore(testSecret, false),
-		rbac:  newRBAC(Policy{}),
+		rbacProvider:  newRBAC(Policy{}),
 		log:   defaultLogger{},
 	}
 
