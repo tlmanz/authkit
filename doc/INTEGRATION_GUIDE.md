@@ -11,7 +11,8 @@ authkit is a Go authentication library that provides:
 - OAuth 2.0 login (GitHub, Google, GitLab)
 - Email/password login with bcrypt
 - Encrypted cookie-based sessions
-- YAML-based role-based access control (RBAC)
+- Role-based access control (RBAC) via YAML file or a pluggable `PolicyProvider` interface
+- Layered RBAC: seed from YAML, let a UI override individual users via a database
 - `net/http` middleware for protecting routes
 - Pluggable logger interface (bring your own or use the default)
 
@@ -164,7 +165,17 @@ func (m *MemoryUserStore) GetUserByEmail(_ context.Context, email string) (*auth
 }
 ```
 
-### Step 3: Create the RBAC policy file
+### Step 3: Configure RBAC
+
+authkit supports three RBAC backends. Choose one:
+
+| Backend | `RBACConfig` | When to use |
+|---------|-------------|-------------|
+| YAML only | `FilePath: "policy.yaml"` | Roles managed entirely in files; no UI needed |
+| Layered (YAML + DB) | `Provider: NewLayeredProvider(...)` | YAML defines initial roles; UI can override per user |
+| Fully custom | `Provider: myProvider` | You supply your own `PolicyProvider` implementation |
+
+#### Option A — YAML only (default)
 
 Create a `policy.yaml` file. This controls who has which permissions.
 
@@ -204,6 +215,123 @@ The only built-in constant is `authkit.PermAll = "*"` — a wildcard that passes
 - Permission strings are matched exactly — `"posts"` does not grant `"posts:read"`
 - `default_role` is optional — fallback for authenticated users not listed under any role. Omit to deny access to unlisted users entirely.
 - Members are matched case-insensitively
+
+#### Option B — Layered provider (YAML baseline + database overrides)
+
+Use this when you want operators to change user roles through a management UI without editing files. The YAML file defines roles and their initial members. Per-user overrides are stored in a database and take precedence over YAML.
+
+**1. Implement `UserRoleStore`**
+
+```go
+type UserRoleStore interface {
+    // Return found=false when no DB override exists — authkit falls back to YAML.
+    GetOverride(ctx context.Context, email string) (role string, permissions []string, found bool, err error)
+    // Called from your management UI to change a user's role.
+    SetOverride(ctx context.Context, email, role string, permissions []string) error
+    // Revert a user to the YAML baseline by removing their override.
+    DeleteOverride(ctx context.Context, email string) error
+}
+```
+
+A Postgres example:
+
+```go
+type RoleStore struct{ db *sql.DB }
+
+func (s *RoleStore) GetOverride(ctx context.Context, email string) (string, []string, bool, error) {
+    var role, permsJSON string
+    err := s.db.QueryRowContext(ctx,
+        "SELECT role, permissions FROM role_overrides WHERE email = $1", email,
+    ).Scan(&role, &permsJSON)
+    if errors.Is(err, sql.ErrNoRows) {
+        return "", nil, false, nil
+    }
+    if err != nil {
+        return "", nil, false, err
+    }
+    var perms []string
+    json.Unmarshal([]byte(permsJSON), &perms)
+    return role, perms, true, nil
+}
+
+func (s *RoleStore) SetOverride(ctx context.Context, email, role string, permissions []string) error {
+    permsJSON, _ := json.Marshal(permissions)
+    _, err := s.db.ExecContext(ctx,
+        `INSERT INTO role_overrides (email, role, permissions)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (email) DO UPDATE SET role = $2, permissions = $3`,
+        email, role, string(permsJSON),
+    )
+    return err
+}
+
+func (s *RoleStore) DeleteOverride(ctx context.Context, email string) error {
+    _, err := s.db.ExecContext(ctx, "DELETE FROM role_overrides WHERE email = $1", email)
+    return err
+}
+```
+
+Required table:
+
+```sql
+CREATE TABLE role_overrides (
+    email       TEXT PRIMARY KEY,
+    role        TEXT NOT NULL,
+    permissions JSONB NOT NULL DEFAULT '[]'
+);
+```
+
+**2. Create the provider and pass it to `New()`**
+
+Pass `authkit.WithLogger(l)` so that DB errors during role lookups are logged rather than silently swallowed.
+
+```go
+provider, err := authkit.NewLayeredProvider("policy.yaml", &RoleStore{db: db},
+    authkit.WithLogger(myLogger),
+)
+if err != nil {
+    log.Fatal(err)
+}
+
+auth, err := authkit.New(authkit.Config{
+    RBAC: authkit.RBACConfig{Provider: provider},
+    // ... rest of config
+})
+
+// WatchRBAC reloads the YAML baseline; DB overrides are always read live.
+go auth.WatchRBAC(ctx, 30*time.Second)
+```
+
+**3. Change a user's role from a management handler**
+
+Use `provider.SetOverride` — it validates the role name against the YAML policy and checks permission string format before writing to the store. Do **not** call `provider.Store().SetOverride` directly from handlers, as it bypasses these checks.
+
+```go
+func setRoleHandler(w http.ResponseWriter, r *http.Request) {
+    email := r.FormValue("email")
+    role  := r.FormValue("role")
+    perms := rolesMap[role] // your app's role→permissions lookup
+
+    if err := provider.SetOverride(r.Context(), email, role, perms); err != nil {
+        // err is descriptive: invalid email, unknown role, bad permission format
+        http.Error(w, err.Error(), http.StatusBadRequest)
+        return
+    }
+    // Change takes effect on the user's next login.
+}
+```
+
+> **Session note:** role changes take effect on the **next login** only. Existing sessions keep their current permissions until they expire (7 days by default) or the user logs out. If a demotion must be enforced immediately, the application must invalidate the user's session — this requires a server-side session store and is outside the scope of authkit.
+
+**4. Revert a user to their YAML role**
+
+```go
+provider.DeleteOverride(ctx, "bob@example.com")
+```
+
+#### Option C — Fully custom `PolicyProvider`
+
+For complete control, implement the `PolicyProvider` interface and supply it via `RBACConfig.Provider`. See the API reference below for the interface definition.
 
 ### Step 4: Generate a session secret
 
@@ -643,6 +771,78 @@ const (
 
 Permissions are fully user-defined strings. `PermAll` is the only constant authkit provides — all other permission names are defined by you in `policy.yaml` and matched exactly in code. See the [Permissions](#permissions) section for naming conventions.
 
+### RBAC interfaces
+
+```go
+// PolicyProvider resolves a user's role and permissions at login time.
+// Supply a custom implementation via RBACConfig.Provider to back RBAC with
+// any storage system (database, remote config service, etc.).
+type PolicyProvider interface {
+    // RoleFor returns the role name and permissions for the given email.
+    // Called on every login and API key auth.
+    RoleFor(ctx context.Context, email string) (role string, permissions []string)
+
+    // PermissionsForRole returns the permissions for a named role.
+    // Used to resolve permissions for API key users.
+    PermissionsForRole(role string) []string
+}
+
+// PolicyReloader is an optional interface for PolicyProvider implementations
+// that support live reloading via WatchRBAC. If your provider does not
+// implement this, WatchRBAC exits immediately and your provider controls
+// its own refresh strategy.
+type PolicyReloader interface {
+    Reload() error
+}
+
+// UserRoleStore persists per-user role overrides for LayeredPolicyProvider.
+// Implement against your preferred database and pass to NewLayeredProvider.
+type UserRoleStore interface {
+    GetOverride(ctx context.Context, email string) (role string, permissions []string, found bool, err error)
+    SetOverride(ctx context.Context, email, role string, permissions []string) error
+    DeleteOverride(ctx context.Context, email string) error
+}
+```
+
+### RBAC constructors
+
+```go
+// NewLayeredProvider creates a YAML-baseline + database-override policy provider.
+// Pass WithLogger(l) to log DB errors during role lookups.
+func NewLayeredProvider(filePath string, store UserRoleStore, opts ...func(*LayeredPolicyProvider)) (*LayeredPolicyProvider, error)
+
+// WithLogger sets a Logger on a LayeredPolicyProvider (functional option).
+func WithLogger(l Logger) func(*LayeredPolicyProvider)
+
+// LayeredPolicyProvider methods
+
+// SetOverride validates and stores a per-user role override.
+// Returns an error if the email/role/permissions are invalid or if the role
+// is not defined in the current YAML policy.
+// NOTE: changes take effect on the user's next login — existing sessions are not invalidated.
+func (l *LayeredPolicyProvider) SetOverride(ctx context.Context, email, role string, permissions []string) error
+
+// DeleteOverride reverts a user to the YAML baseline on their next login.
+func (l *LayeredPolicyProvider) DeleteOverride(ctx context.Context, email string) error
+
+// Store returns the raw UserRoleStore (e.g. for listing overrides in a management UI).
+func (l *LayeredPolicyProvider) Store() UserRoleStore
+```
+
+### RBACConfig
+
+```go
+type RBACConfig struct {
+    // FilePath is the path to the YAML policy file.
+    // Used when Provider is nil (YAML-only mode).
+    FilePath string
+
+    // Provider is a custom PolicyProvider. When set, FilePath is ignored.
+    // Use NewLayeredProvider or supply your own implementation.
+    Provider PolicyProvider
+}
+```
+
 ---
 
 ## Handler request/response reference
@@ -829,11 +1029,15 @@ Use this checklist to verify your integration is complete:
 
 - [ ] Chose auth mode (`AuthModeOAuth`, `AuthModePassword`, or `AuthModeBoth`)
 - [ ] Generated a session secret (`openssl rand -hex 32`) and stored in env var
-- [ ] Created `policy.yaml` with roles, permissions, and members
+- [ ] Chose an RBAC backend:
+  - [ ] **YAML only** — created `policy.yaml` with roles, permissions, and members; set `RBACConfig{FilePath: "policy.yaml"}`
+  - [ ] **Layered** — created `policy.yaml`, implemented `UserRoleStore`, called `NewLayeredProvider`; set `RBACConfig{Provider: provider}`
+  - [ ] **Custom** — implemented `PolicyProvider`; set `RBACConfig{Provider: myProvider}`
 - [ ] If using OAuth: registered OAuth apps and stored client credentials in env vars
 - [ ] If using OAuth: set `CallbackBaseURL` to your public URL
 - [ ] If using password: implemented `UserStore` interface with correct error returns
 - [ ] If using password: created the users table in your database
+- [ ] If using layered RBAC: created the `role_overrides` table in your database
 - [ ] Called `authkit.New()` with your config
 - [ ] Registered auth route handlers on your mux
 - [ ] Protected API routes with `RequireAuth` or `Require(permission)` middleware

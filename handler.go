@@ -27,7 +27,7 @@ func (a *Auth) Callback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	email := gothUser.Email
-	role, permissions := a.rbac.roleFor(email)
+	role, permissions := a.rbacProvider.RoleFor(r.Context(), email)
 
 	u := &User{
 		Email:       email,

@@ -29,7 +29,7 @@ func buildAuthWithAPIKey(t *testing.T, u *User, perms []string) *Auth {
 	}
 	return &Auth{
 		store:        store,
-		rbac:         newRBAC(policy),
+		rbacProvider:         newRBAC(policy),
 		keyValidator: &mockKeyValidator{user: u},
 	}
 }
@@ -66,7 +66,7 @@ func TestRequireAuth_InvalidAPIKey_NoSession_Returns401(t *testing.T) {
 	store := newCookieStore("middleware-test-secret-32-bytes!!", false)
 	a := &Auth{
 		store:        store,
-		rbac:         &rbac{},
+		rbacProvider:         &rbac{},
 		keyValidator: &mockKeyValidator{user: nil}, // validator returns no user
 	}
 
@@ -233,7 +233,7 @@ func TestRequireSession_ValidSessionWithoutPerm_Returns403(t *testing.T) {
 
 func TestRequireAuth_NoValidator_APIKeyInHeader_Returns401(t *testing.T) {
 	// No keyValidator set — even with a bearer token, fall through to session.
-	a := &Auth{store: newCookieStore("test-secret-that-is-32-bytes-ok!", false), rbac: &rbac{}}
+	a := &Auth{store: newCookieStore("test-secret-that-is-32-bytes-ok!", false), rbacProvider: &rbac{}}
 
 	called := false
 	var captured *User

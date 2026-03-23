@@ -202,7 +202,7 @@ roles:
 	}
 
 	// Verify initial state.
-	role, _ := auth.rbac.roleFor("alice@example.com")
+	role, _ := auth.rbacProvider.RoleFor(context.Background(), "alice@example.com")
 	if role != "viewer" {
 		t.Fatalf("initial role: got %q, want viewer", role)
 	}
@@ -225,7 +225,7 @@ roles:
 	time.Sleep(200 * time.Millisecond)
 	cancel()
 
-	role, _ = auth.rbac.roleFor("alice@example.com")
+	role, _ = auth.rbacProvider.RoleFor(context.Background(), "alice@example.com")
 	if role != "admin" {
 		t.Errorf("reloaded role: got %q, want admin", role)
 	}
@@ -264,7 +264,7 @@ roles:
 	cancel()
 
 	// Old policy should be preserved.
-	role, _ := auth.rbac.roleFor("alice@example.com")
+	role, _ := auth.rbacProvider.RoleFor(context.Background(), "alice@example.com")
 	if role != "viewer" {
 		t.Errorf("role after bad reload: got %q, want viewer (old policy kept)", role)
 	}
@@ -272,8 +272,8 @@ roles:
 
 func TestWatchRBAC_StopsOnCancel(t *testing.T) {
 	auth := &Auth{
-		cfg:  Config{RBAC: RBACConfig{}},
-		rbac: newRBAC(Policy{}),
+		cfg:          Config{RBAC: RBACConfig{}},
+		rbacProvider: newRBAC(Policy{}),
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
