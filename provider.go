@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/markbates/goth"
+	"github.com/markbates/goth/providers/bitbucket"
 	"github.com/markbates/goth/providers/github"
 	"github.com/markbates/goth/providers/gitlab"
 	"github.com/markbates/goth/providers/google"
@@ -11,7 +12,8 @@ import (
 
 // ProviderConfig holds the OAuth credentials for a single provider.
 type ProviderConfig struct {
-	// Name is the provider identifier: "github", "google", or "gitlab".
+	// Name is the provider identifier for the built-in wrappers: "bitbucket", "github", "google", or "gitlab".
+	// For any other provider, use Config.GothProviders instead.
 	Name string
 
 	// ClientID and ClientSecret are the OAuth application credentials.
@@ -26,9 +28,10 @@ type ProviderConfig struct {
 // defaultScopes returns the minimum scopes needed to retrieve an email address
 // and display name for each supported provider.
 var defaultScopes = map[string][]string{
-	"github": {"user:email"},
-	"google": {"email", "profile"},
-	"gitlab": {"read_user"},
+	"bitbucket": {"account", "email"},
+	"github":    {"user:email"},
+	"google":    {"email", "profile"},
+	"gitlab":    {"read_user"},
 }
 
 // buildProviders converts the config slice into registered goth.Providers.
@@ -53,6 +56,8 @@ func buildProvider(c ProviderConfig, callbackBaseURL string) (goth.Provider, err
 	callbackURL := callbackBaseURL + "/auth/" + c.Name + "/callback"
 
 	switch c.Name {
+	case "bitbucket":
+		return bitbucket.New(c.ClientID, c.ClientSecret, callbackURL, scopes...), nil
 	case "github":
 		return github.New(c.ClientID, c.ClientSecret, callbackURL, scopes...), nil
 	case "google":
@@ -60,6 +65,6 @@ func buildProvider(c ProviderConfig, callbackBaseURL string) (goth.Provider, err
 	case "gitlab":
 		return gitlab.New(c.ClientID, c.ClientSecret, callbackURL, scopes...), nil
 	default:
-		return nil, fmt.Errorf("authkit: unsupported provider %q (supported: github, google, gitlab)", c.Name)
+		return nil, fmt.Errorf("authkit: unsupported provider name %q — use \"github\", \"google\", or \"gitlab\", or pass a pre-built goth.Provider via Config.GothProviders", c.Name)
 	}
 }

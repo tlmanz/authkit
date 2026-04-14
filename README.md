@@ -9,7 +9,7 @@
 
 Plug-and-play authentication with YAML-based RBAC for Small Go HTTP services.
 
-- **OAuth 2.0** via [markbates/goth](https://github.com/markbates/goth) — supports **GitHub**, **Google**, **GitLab** out of the box
+- **OAuth 2.0** via [markbates/goth](https://github.com/markbates/goth) — supports **GitHub**, **Google**, **GitLab**, **Bitbucket** out of the box, plus [80+ more providers](#other-providers) via `GothProviders`
 - **Email/password** authentication with bcrypt hashing
 - **API key authentication** — plug in any key store via a single-method interface
 - **Three modes**: OAuth only, password only, or both simultaneously
@@ -135,7 +135,7 @@ mux.Handle("POST /api/projects", auth.Require("projects:write")(http.HandlerFunc
 
 | Mode | Constant | Providers required | UserStore required | Use case |
 |------|----------|-------------------|--------------------|----------|
-| OAuth only | `authkit.AuthModeOAuth` | Yes | No | SSO with GitHub/Google/GitLab |
+| OAuth only | `authkit.AuthModeOAuth` | Yes | No | SSO with GitHub/Google/GitLab/Bitbucket/etc. |
 | Password only | `authkit.AuthModePassword` | No | Yes | Traditional email/password |
 | Both | `authkit.AuthModeBoth` | Yes | Yes | Let users choose their method |
 
@@ -244,6 +244,25 @@ auth, err := authkit.New(authkit.Config{
 
 ## OAuth Providers
 
+### Bitbucket
+
+```go
+authkit.ProviderConfig{
+    Name:         "bitbucket",
+    ClientID:     os.Getenv("BITBUCKET_CLIENT_ID"),
+    ClientSecret: os.Getenv("BITBUCKET_CLIENT_SECRET"),
+    // Default scopes: ["account", "email"]
+}
+```
+
+**Where to register:** Bitbucket → Settings → Workspace Settings → OAuth consumers → Add consumer
+
+| Field | Value |
+|-------|-------|
+| Callback URL | `https://example.com/auth/bitbucket/callback` |
+| Callback URL (local dev) | `http://localhost:8080/auth/bitbucket/callback` |
+| Permissions | Account: **Read**, Email addresses: **Read** |
+
 ### GitHub
 
 ```go
@@ -305,16 +324,46 @@ authkit.ProviderConfig{
 
 ```go
 Providers: []authkit.ProviderConfig{
-    {Name: "github", ClientID: "...", ClientSecret: "..."},
-    {Name: "google", ClientID: "...", ClientSecret: "..."},
-    {Name: "gitlab", ClientID: "...", ClientSecret: "..."},
+    {Name: "bitbucket", ClientID: "...", ClientSecret: "..."},
+    {Name: "github",    ClientID: "...", ClientSecret: "..."},
+    {Name: "google",    ClientID: "...", ClientSecret: "..."},
+    {Name: "gitlab",    ClientID: "...", ClientSecret: "..."},
 },
 ```
 
 Users can then choose their provider via the login URL:
+- `GET /auth/bitbucket`
 - `GET /auth/github`
 - `GET /auth/google`
 - `GET /auth/gitlab`
+
+### Other providers
+
+authkit ships convenience wrappers for Bitbucket, GitHub, Google, and GitLab. For any of the [80+ other providers](https://github.com/markbates/goth?tab=readme-ov-file#supported-providers) that goth supports (Spotify, Discord, Slack, Microsoft, Twitter, etc.), import the provider package directly and pass the pre-built value via `GothProviders`:
+
+```go
+import (
+    "github.com/markbates/goth/providers/discord"
+    "github.com/markbates/goth/providers/spotify"
+)
+
+auth, err := authkit.New(authkit.Config{
+    // Built-in wrappers still work alongside GothProviders.
+    Providers: []authkit.ProviderConfig{
+        {Name: "github", ClientID: "...", ClientSecret: "..."},
+    },
+    GothProviders: []goth.Provider{
+        spotify.New(os.Getenv("SPOTIFY_ID"), os.Getenv("SPOTIFY_SECRET"),
+            "https://example.com/auth/spotify/callback", "user-read-email"),
+        discord.New(os.Getenv("DISCORD_ID"), os.Getenv("DISCORD_SECRET"),
+            "https://example.com/auth/discord/callback", "identify", "email"),
+    },
+    CallbackBaseURL: "https://example.com",
+    // ...
+})
+```
+
+The callback URL pattern is always `/auth/{providerName}/callback`, where `providerName` is whatever the goth provider reports via its `Name()` method (e.g. `"spotify"`, `"discord"`). Only the packages you import are compiled into your binary.
 
 ---
 

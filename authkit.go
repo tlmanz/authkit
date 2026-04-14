@@ -66,9 +66,30 @@ type Config struct {
 	// Defaults to AuthModeOAuth for backward compatibility.
 	Mode AuthMode
 
-	// Providers is the list of OAuth providers to enable.
-	// Required when Mode is AuthModeOAuth or AuthModeBoth.
+	// Providers is the list of OAuth providers to enable using the built-in
+	// convenience wrappers (github, google, gitlab).
+	// Required when Mode is AuthModeOAuth or AuthModeBoth, unless GothProviders
+	// is supplied instead.
 	Providers []ProviderConfig
+
+	// GothProviders is a list of pre-constructed goth.Provider values.
+	// Use this to enable any of the 80+ providers that goth supports beyond the
+	// three built-in convenience wrappers. Import the provider package you need
+	// from github.com/markbates/goth/providers/*, construct the provider, and
+	// pass it here. It is merged with any providers built from Providers.
+	//
+	// Example — add Spotify and Discord:
+	//
+	//	import (
+	//	    "github.com/markbates/goth/providers/spotify"
+	//	    "github.com/markbates/goth/providers/discord"
+	//	)
+	//
+	//	GothProviders: []goth.Provider{
+	//	    spotify.New(clientID, secret, callbackURL, "user-read-email"),
+	//	    discord.New(clientID, secret, callbackURL, "identify", "email"),
+	//	},
+	GothProviders []goth.Provider
 
 	// CallbackBaseURL is the externally-reachable base URL of the service
 	// (e.g. "https://example.com"). The OAuth callback URLs are derived as
@@ -148,8 +169,8 @@ func New(cfg Config) (*Auth, error) {
 		if _, err := url.ParseRequestURI(cfg.CallbackBaseURL); err != nil {
 			return nil, fmt.Errorf("authkit: CallbackBaseURL is not a valid URL: %w", err)
 		}
-		if len(cfg.Providers) == 0 {
-			return nil, fmt.Errorf("authkit: at least one provider is required when OAuth is enabled")
+		if len(cfg.Providers) == 0 && len(cfg.GothProviders) == 0 {
+			return nil, fmt.Errorf("authkit: at least one provider is required when OAuth is enabled (use Providers or GothProviders)")
 		}
 	}
 
@@ -180,6 +201,7 @@ func New(cfg Config) (*Auth, error) {
 		if err != nil {
 			return nil, err
 		}
+		providers = append(providers, cfg.GothProviders...)
 		goth.UseProviders(providers...)
 
 		// Override gothic's provider name extraction to use Go 1.22+ path values
