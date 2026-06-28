@@ -1,6 +1,7 @@
 package authkit
 
 import (
+	"context"
 	"net/http"
 	"strings"
 )
@@ -18,9 +19,9 @@ func extractBearerToken(r *http.Request) string {
 }
 
 // tryAPIKeyAuth checks the request for a bearer token and, if a valid API key
-// is found, returns a fully populated User (with permissions resolved from the
-// RBAC policy). Returns nil when no key is present, the key is invalid, or
-// APIKeyValidator is not configured.
+// is found, returns the associated User (with Tenant + Role populated by the
+// validator). Permissions are resolved by inject, not here. Returns nil when no
+// key is present, the key is invalid, or APIKeyValidator is not configured.
 func (a *Auth) tryAPIKeyAuth(r *http.Request) *User {
 	if a.keyValidator == nil {
 		return nil
@@ -33,9 +34,44 @@ func (a *Auth) tryAPIKeyAuth(r *http.Request) *User {
 	if err != nil || u == nil {
 		return nil
 	}
-	// Resolve RBAC permissions for the role assigned to this API key.
-	u.permissions = a.rbacProvider.PermissionsForRole(u.Role)
 	return u
+}
+
+// permsForRole resolves the permissions for (tenant, role), consulting the TTL
+// cache first. The tenant must already be set on ctx so a DB-backed, tenant-aware
+// PolicyProvider scopes its lookup correctly.
+func (a *Auth) permsForRole(ctx context.Context, tenantID, role string) []string {
+	if role == "" {
+		return nil
+	}
+	key := tenantID + "|" + role
+	if a.permCache != nil {
+		if p, ok := a.permCache.get(key); ok {
+			return p
+		}
+	}
+	p := a.rbacProvider.PermissionsForRole(ctx, role)
+	if a.permCache != nil {
+		a.permCache.put(key, p)
+	}
+	return p
+}
+
+// inject sets the tenant on the request context, (re)resolves the user's
+// permissions when required, attaches the user, and returns the updated request.
+//
+// forceResolve is true for credentials with no cached permissions (API keys).
+// For session users, permissions were cached at login and are trusted unless
+// LivePermissionResolution is enabled, in which case they are re-resolved per
+// request (so role/permission changes take effect within the cache TTL rather
+// than only on next login).
+func (a *Auth) inject(r *http.Request, u *User, forceResolve bool) *http.Request {
+	ctx := WithTenant(r.Context(), u.TenantID)
+	if forceResolve || a.cfg.LivePermissionResolution {
+		u.permissions = a.permsForRole(ctx, u.TenantID, u.Role)
+	}
+	ctx = withUser(ctx, u)
+	return r.WithContext(ctx)
 }
 
 // RequireAuth is middleware that enforces a valid credential — either an API
@@ -45,7 +81,7 @@ func (a *Auth) tryAPIKeyAuth(r *http.Request) *User {
 func (a *Auth) RequireAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if u := a.tryAPIKeyAuth(r); u != nil {
-			next.ServeHTTP(w, r.WithContext(withUser(r.Context(), u)))
+			next.ServeHTTP(w, a.inject(r, u, true))
 			return
 		}
 		u, err := userFromSession(a.store, r, a.log)
@@ -53,7 +89,7 @@ func (a *Auth) RequireAuth(next http.Handler) http.Handler {
 			http.Error(w, "unauthenticated", http.StatusUnauthorized)
 			return
 		}
-		next.ServeHTTP(w, r.WithContext(withUser(r.Context(), u)))
+		next.ServeHTTP(w, a.inject(r, u, false))
 	})
 }
 
@@ -64,11 +100,12 @@ func (a *Auth) Require(permission string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if u := a.tryAPIKeyAuth(r); u != nil {
+				r = a.inject(r, u, true)
 				if !u.Can(permission) {
 					http.Error(w, "forbidden", http.StatusForbidden)
 					return
 				}
-				next.ServeHTTP(w, r.WithContext(withUser(r.Context(), u)))
+				next.ServeHTTP(w, r)
 				return
 			}
 			u, err := userFromSession(a.store, r, a.log)
@@ -76,11 +113,12 @@ func (a *Auth) Require(permission string) func(http.Handler) http.Handler {
 				http.Error(w, "unauthenticated", http.StatusUnauthorized)
 				return
 			}
+			r = a.inject(r, u, false)
 			if !u.Can(permission) {
 				http.Error(w, "forbidden", http.StatusForbidden)
 				return
 			}
-			next.ServeHTTP(w, r.WithContext(withUser(r.Context(), u)))
+			next.ServeHTTP(w, r)
 		})
 	}
 }
@@ -95,7 +133,7 @@ func (a *Auth) RequireSessionAuth(next http.Handler) http.Handler {
 			http.Error(w, "unauthenticated", http.StatusUnauthorized)
 			return
 		}
-		next.ServeHTTP(w, r.WithContext(withUser(r.Context(), u)))
+		next.ServeHTTP(w, a.inject(r, u, false))
 	})
 }
 
@@ -109,11 +147,12 @@ func (a *Auth) RequireSession(permission string) func(http.Handler) http.Handler
 				http.Error(w, "unauthenticated", http.StatusUnauthorized)
 				return
 			}
+			r = a.inject(r, u, false)
 			if !u.Can(permission) {
 				http.Error(w, "forbidden", http.StatusForbidden)
 				return
 			}
-			next.ServeHTTP(w, r.WithContext(withUser(r.Context(), u)))
+			next.ServeHTTP(w, r)
 		})
 	}
 }

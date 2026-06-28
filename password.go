@@ -29,6 +29,12 @@ type PasswordUser struct {
 	Email          string
 	Name           string
 	HashedPassword string
+
+	// TenantID binds this credential to one tenant; BranchID is an optional
+	// in-tenant scope. The store populates them (email is global, so the lookup
+	// determines the tenant). They are copied onto the authenticated User.
+	TenantID string
+	BranchID string
 }
 
 // Sentinel errors for UserStore implementations.

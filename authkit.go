@@ -135,6 +135,23 @@ type Config struct {
 	// skip API key auth entirely (session-only routes).
 	// If nil, API key auth is disabled and only sessions are accepted.
 	APIKeyValidator APIKeyValidator
+
+	// AuditSink receives security audit events (login, logout, refresh, revoke,
+	// 2fa_*, role_change, permission_change, impersonate). If nil, a
+	// NopAuditSink is installed so authkit can emit unconditionally.
+	AuditSink AuditSink
+
+	// LivePermissionResolution makes Require/RequireAuth re-resolve a session
+	// user's permissions from the PolicyProvider on every request (through a
+	// short TTL cache), so role and permission changes take effect within the
+	// cache window rather than only on next login. Multi-tenant deploys want
+	// this on; single-shop deploys can leave it off (cheaper login-time cache).
+	// API-key credentials always resolve live regardless of this flag.
+	LivePermissionResolution bool
+
+	// PermissionCacheTTL bounds how stale a live-resolved permission set may be.
+	// Defaults to 30s when LivePermissionResolution is enabled.
+	PermissionCacheTTL time.Duration
 }
 
 // Auth is the central object. Create one with New() and attach its methods as
@@ -145,6 +162,8 @@ type Auth struct {
 	rbacProvider PolicyProvider
 	log          Logger
 	keyValidator APIKeyValidator
+	audit        AuditSink
+	permCache    *permCache
 }
 
 // New validates the config, registers the OAuth providers with goth, loads the
@@ -227,7 +246,23 @@ func New(cfg Config) (*Auth, error) {
 		return nil, fmt.Errorf("authkit: load RBAC policy: %w", err)
 	}
 
-	return &Auth{cfg: cfg, store: store, rbacProvider: provider, log: cfg.Logger, keyValidator: cfg.APIKeyValidator}, nil
+	audit := cfg.AuditSink
+	if audit == nil {
+		audit = NopAuditSink{}
+	}
+
+	// Permission cache backs live per-request resolution. Built only when that
+	// mode is on, so the cheaper login-time path stays allocation-free.
+	var pc *permCache
+	if cfg.LivePermissionResolution {
+		ttl := cfg.PermissionCacheTTL
+		if ttl <= 0 {
+			ttl = 30 * time.Second
+		}
+		pc = newPermCache(ttl)
+	}
+
+	return &Auth{cfg: cfg, store: store, rbacProvider: provider, log: cfg.Logger, keyValidator: cfg.APIKeyValidator, audit: audit, permCache: pc}, nil
 }
 
 // WatchRBAC starts a background goroutine that reloads the RBAC policy file

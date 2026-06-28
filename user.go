@@ -9,8 +9,18 @@ type User struct {
 	Provider  string `json:"provider"`
 	Role      string `json:"role"`
 
-	// permissions is resolved from the RBAC policy at login time and cached
-	// in the session so every subsequent request avoids a policy lookup.
+	// TenantID binds the principal to one tenant (the hard security boundary).
+	// Populated in every credential path: UserStore (password), the OAuth
+	// callback mapping, and APIKeyValidator. Used to set the per-transaction
+	// RLS GUC and to key tenant-scoped permission resolution.
+	TenantID string `json:"tenantId"`
+
+	// BranchID is an optional authorization scope within a tenant (not an RLS
+	// boundary). Carried into queries as a row filter, never as a permission.
+	BranchID string `json:"branchId,omitempty"`
+
+	// permissions is resolved from the RBAC policy — at login time (cached in
+	// the session) or per request when LivePermissionResolution is enabled.
 	permissions []string
 }
 

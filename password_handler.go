@@ -49,13 +49,25 @@ func (a *Auth) Register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Auto-login: resolve RBAC role and create session.
-	role, permissions := a.rbacProvider.RoleFor(r.Context(), email)
+	// Re-read the persisted user so the auto-login session carries the tenant
+	// (and any store-assigned fields). CreateUser does not return the tenant.
+	storedUser, err := a.cfg.UserStore.GetUserByEmail(r.Context(), email)
+	if err != nil {
+		a.log.Error("authkit: post-register lookup failed for %q: %v", email, err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	// Auto-login: scope ctx to the user's tenant, resolve RBAC role, create session.
+	ctx := WithTenant(r.Context(), storedUser.TenantID)
+	role, permissions := a.rbacProvider.RoleFor(ctx, email)
 	u := &User{
 		Email:       email,
 		Name:        name,
 		Provider:    "password",
 		Role:        role,
+		TenantID:    storedUser.TenantID,
+		BranchID:    storedUser.BranchID,
 		permissions: permissions,
 	}
 
@@ -95,12 +107,17 @@ func (a *Auth) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	role, permissions := a.rbacProvider.RoleFor(r.Context(), email)
+	// Scope ctx to the user's tenant so a tenant-aware PolicyProvider resolves
+	// role/permissions against the right tenant.
+	ctx := WithTenant(r.Context(), storedUser.TenantID)
+	role, permissions := a.rbacProvider.RoleFor(ctx, email)
 	u := &User{
 		Email:       email,
 		Name:        storedUser.Name,
 		Provider:    "password",
 		Role:        role,
+		TenantID:    storedUser.TenantID,
+		BranchID:    storedUser.BranchID,
 		permissions: permissions,
 	}
 

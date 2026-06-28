@@ -29,10 +29,12 @@ type PolicyProvider interface {
 	// the user has no assigned role.
 	RoleFor(ctx context.Context, email string) (role string, permissions []string)
 
-	// PermissionsForRole returns the permissions for a named role.
-	// Used to resolve permissions for API key users whose validator returns
-	// a role name rather than an email lookup.
-	PermissionsForRole(role string) []string
+	// PermissionsForRole returns the permissions for a named role. The ctx
+	// carries the tenant (via TenantIDFromCtx) so role definitions can be
+	// per-tenant — a DB-backed provider scopes its lookup to that tenant.
+	// Used to resolve permissions for API key users and for per-request live
+	// resolution (LivePermissionResolution).
+	PermissionsForRole(ctx context.Context, role string) []string
 }
 
 // PolicyReloader is an optional interface that PolicyProvider implementations
@@ -102,8 +104,9 @@ func (r *rbac) RoleFor(_ context.Context, email string) (string, []string) {
 	return r.roleFor(email)
 }
 
-// PermissionsForRole implements PolicyProvider.
-func (r *rbac) PermissionsForRole(role string) []string {
+// PermissionsForRole implements PolicyProvider. The YAML provider is not
+// tenant-aware (single-shop fallback), so ctx is ignored.
+func (r *rbac) PermissionsForRole(_ context.Context, role string) []string {
 	return r.permissionsForRole(role)
 }
 

@@ -104,7 +104,8 @@ func (l *LayeredPolicyProvider) RoleFor(ctx context.Context, email string) (stri
 
 // PermissionsForRole implements PolicyProvider. Resolves permissions for a
 // named role from the YAML baseline — role definitions are always file-managed.
-func (l *LayeredPolicyProvider) PermissionsForRole(role string) []string {
+// ctx is unused: the layered provider's role definitions are not per-tenant.
+func (l *LayeredPolicyProvider) PermissionsForRole(_ context.Context, role string) []string {
 	return l.yaml.permissionsForRole(role)
 }
 
