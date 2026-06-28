@@ -147,6 +147,7 @@ func (a *Auth) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	a.emitAudit(ctx, AuditEvent{Type: AuditLogin, TenantID: u.TenantID, Actor: email, Subject: email, IP: clientIP(r), At: nowFn()})
 	http.Redirect(w, r, a.cfg.AfterLoginURL, http.StatusSeeOther)
 }
 

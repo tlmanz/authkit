@@ -24,6 +24,10 @@ type Session struct {
 	Role        string
 	Permissions []string
 
+	// Platform marks a super-admin (platform principal) session — no tenant.
+	// Tenant and platform sessions use different cookies, so they never cross.
+	Platform bool
+
 	// CreatedAt anchors the absolute timeout; LastSeenAt anchors the idle
 	// timeout (advanced by Touch on a sliding basis).
 	CreatedAt  time.Time

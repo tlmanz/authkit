@@ -50,3 +50,11 @@ type NopAuditSink struct{}
 
 // Emit implements AuditSink and does nothing.
 func (NopAuditSink) Emit(context.Context, AuditEvent) {}
+
+// emitAudit emits an event, tolerating a nil sink (Auth values constructed
+// outside New, e.g. in tests, have no default sink installed).
+func (a *Auth) emitAudit(ctx context.Context, ev AuditEvent) {
+	if a.audit != nil {
+		a.audit.Emit(ctx, ev)
+	}
+}

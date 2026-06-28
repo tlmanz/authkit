@@ -37,6 +37,17 @@ func (a *Auth) tryAPIKeyAuth(r *http.Request) *User {
 	return u
 }
 
+// tryBearer resolves a bearer credential: a token-layer access JWT first (when
+// tokens are enabled), then an API key. Both resolve permissions server-side
+// via inject, so a JWT carries identity only and role/permission changes take
+// effect within one access-token TTL.
+func (a *Auth) tryBearer(r *http.Request) *User {
+	if u := a.tryTokenAuth(r); u != nil {
+		return u
+	}
+	return a.tryAPIKeyAuth(r)
+}
+
 // permsForRole resolves the permissions for (tenant, role), consulting the TTL
 // cache first. The tenant must already be set on ctx so a DB-backed, tenant-aware
 // PolicyProvider scopes its lookup correctly.
@@ -80,7 +91,7 @@ func (a *Auth) inject(r *http.Request, u *User, forceResolve bool) *http.Request
 // On success it injects the User into the request context.
 func (a *Auth) RequireAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if u := a.tryAPIKeyAuth(r); u != nil {
+		if u := a.tryBearer(r); u != nil {
 			next.ServeHTTP(w, a.inject(r, u, true))
 			return
 		}
@@ -99,7 +110,7 @@ func (a *Auth) RequireAuth(next http.Handler) http.Handler {
 func (a *Auth) Require(permission string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if u := a.tryAPIKeyAuth(r); u != nil {
+			if u := a.tryBearer(r); u != nil {
 				r = a.inject(r, u, true)
 				if !u.Can(permission) {
 					http.Error(w, "forbidden", http.StatusForbidden)

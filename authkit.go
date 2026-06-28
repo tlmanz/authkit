@@ -188,6 +188,48 @@ type Config struct {
 	// AppName is the issuer shown in authenticator apps (the TOTP provisioning
 	// URL). Defaults to "App".
 	AppName string
+
+	// ── Mobile token layer (§7.6) ─────────────────────────────────────────
+	// EnableTokens turns on the OAuth2/PKCE token endpoints and the bearer-JWT
+	// verifier. Requires SigningKeys and RefreshTokenStore.
+	EnableTokens bool
+
+	// SigningKeys is the Ed25519 rotation ring; the first key signs new access
+	// tokens, all keys verify (and are published via JWKS).
+	SigningKeys []SigningKey
+
+	// AccessTokenTTL is the access-JWT lifetime (default 15m); RefreshTokenTTL
+	// the refresh lifetime (default 30d).
+	AccessTokenTTL  time.Duration
+	RefreshTokenTTL time.Duration
+
+	// RefreshTokenStore persists opaque refresh tokens (rotation + reuse
+	// detection).
+	RefreshTokenStore RefreshTokenStore
+
+	// TokenIssuer is the JWT `iss` claim; TokenClientID the public mobile
+	// client id (also the JWT audience); TokenRedirectURIs the allowed PKCE
+	// redirect URIs.
+	TokenIssuer       string
+	TokenClientID     string
+	TokenRedirectURIs []string
+
+	// ── Platform / super-admin (§6.6, §7.11) ──────────────────────────────
+	// PlatformAdminStore + PlatformPolicy enable the platform principal axis
+	// (separate from tenant users). EnableImpersonation gates break-glass
+	// single-tenant access.
+	PlatformAdminStore  PlatformAdminStore
+	PlatformPolicy      PlatformPolicy
+	EnableImpersonation bool
+
+	// ── Device principals / print agents (§7.12) ──────────────────────────
+	// DeviceTokenValidator enables the device principal axis (print agents).
+	// When set, RequireDevice and AuthenticateDevice validate opaque device
+	// tokens against it. A device principal is confined to the fixed print:*
+	// capabilities and is a separate credential path from the human/API-key
+	// flow, so a device can do nothing else in the API. When nil, device auth
+	// is disabled.
+	DeviceTokenValidator DeviceTokenValidator
 }
 
 // Auth is the central object. Create one with New() and attach its methods as
@@ -199,8 +241,10 @@ type Auth struct {
 	log          Logger
 	keyValidator APIKeyValidator
 	audit        AuditSink
-	permCache    *permCache
-	throttler    LoginThrottler
+	permCache       *permCache
+	throttler       LoginThrottler
+	keyring         *keyring
+	deviceValidator DeviceTokenValidator
 }
 
 // New validates the config, registers the OAuth providers with goth, loads the
@@ -299,7 +343,19 @@ func New(cfg Config) (*Auth, error) {
 		pc = newPermCache(ttl)
 	}
 
-	return &Auth{cfg: cfg, store: store, rbacProvider: provider, log: cfg.Logger, keyValidator: cfg.APIKeyValidator, audit: audit, permCache: pc, throttler: cfg.Throttler}, nil
+	// Token layer: build the Ed25519 keyring when enabled.
+	var kr *keyring
+	if cfg.EnableTokens {
+		if cfg.RefreshTokenStore == nil {
+			return nil, fmt.Errorf("authkit: EnableTokens requires a RefreshTokenStore")
+		}
+		kr, err = newKeyring(cfg.SigningKeys)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return &Auth{cfg: cfg, store: store, rbacProvider: provider, log: cfg.Logger, keyValidator: cfg.APIKeyValidator, audit: audit, permCache: pc, throttler: cfg.Throttler, keyring: kr, deviceValidator: cfg.DeviceTokenValidator}, nil
 }
 
 // WatchRBAC starts a background goroutine that reloads the RBAC policy file
