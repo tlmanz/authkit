@@ -84,7 +84,7 @@ func (a *Auth) RequireAuth(next http.Handler) http.Handler {
 			next.ServeHTTP(w, a.inject(r, u, true))
 			return
 		}
-		u, err := userFromSession(a.store, r, a.log)
+		u, err := a.loadSession(r.Context(), r)
 		if err != nil || u == nil {
 			http.Error(w, "unauthenticated", http.StatusUnauthorized)
 			return
@@ -108,7 +108,7 @@ func (a *Auth) Require(permission string) func(http.Handler) http.Handler {
 				next.ServeHTTP(w, r)
 				return
 			}
-			u, err := userFromSession(a.store, r, a.log)
+			u, err := a.loadSession(r.Context(), r)
 			if err != nil || u == nil {
 				http.Error(w, "unauthenticated", http.StatusUnauthorized)
 				return
@@ -128,7 +128,7 @@ func (a *Auth) Require(permission string) func(http.Handler) http.Handler {
 // (e.g. /auth/me, UI-only management actions).
 func (a *Auth) RequireSessionAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		u, err := userFromSession(a.store, r, a.log)
+		u, err := a.loadSession(r.Context(), r)
 		if err != nil || u == nil {
 			http.Error(w, "unauthenticated", http.StatusUnauthorized)
 			return
@@ -142,7 +142,7 @@ func (a *Auth) RequireSessionAuth(next http.Handler) http.Handler {
 func (a *Auth) RequireSession(permission string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			u, err := userFromSession(a.store, r, a.log)
+			u, err := a.loadSession(r.Context(), r)
 			if err != nil || u == nil {
 				http.Error(w, "unauthenticated", http.StatusUnauthorized)
 				return

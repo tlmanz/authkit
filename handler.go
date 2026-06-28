@@ -38,7 +38,7 @@ func (a *Auth) Callback(w http.ResponseWriter, r *http.Request) {
 		permissions: permissions,
 	}
 
-	if err := saveUserToSession(a.store, w, r, u); err != nil {
+	if err := a.saveSession(r.Context(), w, r, u); err != nil {
 		http.Error(w, "session error", http.StatusInternalServerError)
 		return
 	}
@@ -50,7 +50,7 @@ func (a *Auth) Callback(w http.ResponseWriter, r *http.Request) {
 // Mount this on: POST /auth/logout
 func (a *Auth) Logout(w http.ResponseWriter, r *http.Request) {
 	_ = gothic.Logout(w, r)
-	clearSession(a.store, w, r)
+	a.endSession(r.Context(), w, r)
 	http.Redirect(w, r, a.cfg.AfterLogoutURL, http.StatusSeeOther)
 }
 
@@ -62,7 +62,7 @@ func (a *Auth) Me(w http.ResponseWriter, r *http.Request) {
 	if u == nil {
 		// Me can also be called without RequireAuth in the chain — handle that.
 		var err error
-		u, err = userFromSession(a.store, r, a.log)
+		u, err = a.loadSession(r.Context(), r)
 		if err != nil || u == nil {
 			w.Header().Set("Content-Type", "application/json")
 			http.Error(w, `{"error":"unauthenticated"}`, http.StatusUnauthorized)

@@ -152,6 +152,42 @@ type Config struct {
 	// PermissionCacheTTL bounds how stale a live-resolved permission set may be.
 	// Defaults to 30s when LivePermissionResolution is enabled.
 	PermissionCacheTTL time.Duration
+
+	// SessionStore enables revocable, server-side sessions. When set, the cookie
+	// carries only an opaque session ID and all identity state lives in the
+	// store, allowing instant revocation and "log out everywhere". When nil,
+	// authkit falls back to the legacy encrypted-cookie session.
+	SessionStore SessionStore
+
+	// IdleTimeout expires a session after inactivity (sliding). Defaults to 30m.
+	// Only used with SessionStore.
+	IdleTimeout time.Duration
+
+	// AbsoluteTimeout caps a session's total lifetime regardless of activity.
+	// Defaults to 24h. Only used with SessionStore.
+	AbsoluteTimeout time.Duration
+
+	// EnableCSRF turns on the CSRF middleware (signed double-submit) for
+	// cookie-authenticated, state-changing requests. Token-authenticated
+	// requests are always exempt.
+	EnableCSRF bool
+
+	// Throttler rate-limits password login attempts (per account+IP). When nil,
+	// no throttling is applied.
+	Throttler LoginThrottler
+
+	// TOTPStore enables two-step auth (TOTP). When set, a user whose role is in
+	// Require2FAForRoles must complete a TOTP challenge after the password step.
+	// When nil, 2FA is disabled.
+	TOTPStore TOTPStore
+
+	// Require2FAForRoles lists the roles that must complete 2FA (e.g. owner,
+	// manager). Only consulted when TOTPStore is set.
+	Require2FAForRoles []string
+
+	// AppName is the issuer shown in authenticator apps (the TOTP provisioning
+	// URL). Defaults to "App".
+	AppName string
 }
 
 // Auth is the central object. Create one with New() and attach its methods as
@@ -164,6 +200,7 @@ type Auth struct {
 	keyValidator APIKeyValidator
 	audit        AuditSink
 	permCache    *permCache
+	throttler    LoginThrottler
 }
 
 // New validates the config, registers the OAuth providers with goth, loads the
@@ -262,7 +299,7 @@ func New(cfg Config) (*Auth, error) {
 		pc = newPermCache(ttl)
 	}
 
-	return &Auth{cfg: cfg, store: store, rbacProvider: provider, log: cfg.Logger, keyValidator: cfg.APIKeyValidator, audit: audit, permCache: pc}, nil
+	return &Auth{cfg: cfg, store: store, rbacProvider: provider, log: cfg.Logger, keyValidator: cfg.APIKeyValidator, audit: audit, permCache: pc, throttler: cfg.Throttler}, nil
 }
 
 // WatchRBAC starts a background goroutine that reloads the RBAC policy file

@@ -1,6 +1,7 @@
 package authkit
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strings"
@@ -71,7 +72,7 @@ func (a *Auth) Register(w http.ResponseWriter, r *http.Request) {
 		permissions: permissions,
 	}
 
-	if err := saveUserToSession(a.store, w, r, u); err != nil {
+	if err := a.saveSession(ctx, w, r, u); err != nil {
 		a.log.Error("authkit: session error during registration: %v", err)
 		http.Error(w, "session error", http.StatusInternalServerError)
 		return
@@ -93,24 +94,43 @@ func (a *Auth) Login(w http.ResponseWriter, r *http.Request) {
 	email := strings.ToLower(strings.TrimSpace(r.FormValue("email")))
 	password := r.FormValue("password")
 
+	// Throttle per account+IP to blunt brute force / credential stuffing.
+	tkey := throttleKey(email, clientIP(r))
+	if !a.throttleAllow(w, r, tkey) {
+		return
+	}
+
 	storedUser, err := a.cfg.UserStore.GetUserByEmail(r.Context(), email)
 	if err != nil {
 		// Constant-time: run a dummy bcrypt compare to prevent timing-based
 		// user enumeration.
 		_ = bcrypt.CompareHashAndPassword(dummyHash, []byte(password))
+		a.throttleFailure(r.Context(), tkey)
 		http.Error(w, "invalid email or password", http.StatusUnauthorized)
 		return
 	}
 
 	if !CheckPassword(storedUser.HashedPassword, password) {
+		a.throttleFailure(r.Context(), tkey)
 		http.Error(w, "invalid email or password", http.StatusUnauthorized)
 		return
 	}
+
+	// Success — clear the failure counter.
+	a.throttleReset(r.Context(), tkey)
 
 	// Scope ctx to the user's tenant so a tenant-aware PolicyProvider resolves
 	// role/permissions against the right tenant.
 	ctx := WithTenant(r.Context(), storedUser.TenantID)
 	role, permissions := a.rbacProvider.RoleFor(ctx, email)
+
+	// Two-step auth: when the role requires 2FA, stop here and start the TOTP
+	// challenge instead of minting a session.
+	if a.cfg.TOTPStore != nil && a.requires2FA(role) {
+		a.beginTwoFactor(ctx, w, email)
+		return
+	}
+
 	u := &User{
 		Email:       email,
 		Name:        storedUser.Name,
@@ -121,11 +141,27 @@ func (a *Auth) Login(w http.ResponseWriter, r *http.Request) {
 		permissions: permissions,
 	}
 
-	if err := saveUserToSession(a.store, w, r, u); err != nil {
+	if err := a.saveSession(ctx, w, r, u); err != nil {
 		a.log.Error("authkit: session error during login: %v", err)
 		http.Error(w, "session error", http.StatusInternalServerError)
 		return
 	}
 
 	http.Redirect(w, r, a.cfg.AfterLoginURL, http.StatusSeeOther)
+}
+
+// establishLoginSession resolves the user's role/permissions and creates the
+// session. Shared by the post-2FA verify path.
+func (a *Auth) establishLoginSession(ctx context.Context, w http.ResponseWriter, r *http.Request, email string, storedUser *PasswordUser) error {
+	role, permissions := a.rbacProvider.RoleFor(ctx, email)
+	u := &User{
+		Email:       email,
+		Name:        storedUser.Name,
+		Provider:    "password",
+		Role:        role,
+		TenantID:    storedUser.TenantID,
+		BranchID:    storedUser.BranchID,
+		permissions: permissions,
+	}
+	return a.saveSession(ctx, w, r, u)
 }
