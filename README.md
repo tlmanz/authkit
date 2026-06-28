@@ -12,13 +12,23 @@ Plug-and-play authentication with YAML-based RBAC for Small Go HTTP services.
 - **OAuth 2.0** via [markbates/goth](https://github.com/markbates/goth) — supports **GitHub**, **Google**, **GitLab**, **Bitbucket** out of the box, plus [80+ more providers](#other-providers) via `GothProviders`
 - **Email/password** authentication with bcrypt hashing
 - **API key authentication** — plug in any key store via a single-method interface
+- **Two-factor auth (TOTP)** — per-role 2FA enforcement with authenticator apps + single-use recovery codes
+- **Mobile token layer** — OAuth2 Authorization Code + PKCE, Ed25519-signed access JWTs, rotating refresh tokens with reuse detection, and a JWKS endpoint
 - **Three modes**: OAuth only, password only, or both simultaneously
+- **Multi-tenant aware** — every principal carries a `TenantID` (and optional `BranchID`) for RLS-scoped data access and per-tenant role resolution
+- **Server-side sessions** (optional) — revocable, opaque-ID sessions with idle + absolute timeouts and "log out everywhere"; falls back to encrypted cookie sessions
+- **CSRF protection** — signed double-submit middleware for cookie-authenticated requests
+- **Login throttling** — pluggable per-account+IP rate limiting against brute force / credential stuffing
+- **Platform super-admin axis** — separate platform principals with capability checks and audited, break-glass tenant impersonation
+- **Device principals** — confined print-agent tokens with a fixed capability set, isolated from the human/API-key path
+- **Audit sink** — emit structured security events (login, logout, refresh, revoke, 2FA, role/permission change, impersonate)
 - Encrypted cookie sessions via [gorilla/sessions](https://github.com/gorilla/sessions)
 - Role-Based Access Control via YAML file or a pluggable `PolicyProvider` interface
 - **Layered RBAC** — seed roles from YAML, then let a UI override individual users via a database
+- **Live permission resolution** (optional) — re-resolve a session's permissions per request through a short TTL cache so role changes take effect without re-login
 - Live policy reload without restarts (`WatchRBAC`)
 - Works with Go 1.22+ stdlib `net/http` (no external router required)
-- Storage-agnostic — implement a 2-method interface for your database
+- Storage-agnostic — implement small interfaces for your database
 - Pluggable logger — bring your own (`slog`, `zap`, `zerolog`) or use the default
 
 ---
@@ -159,6 +169,7 @@ type UserStore interface {
 - `CreateUser` must return `authkit.ErrUserExists` if the email is already taken.
 - `GetUserByEmail` must return `authkit.ErrUserNotFound` if no user matches.
 - Passwords are pre-hashed with bcrypt before being passed to `CreateUser`.
+- The returned `*PasswordUser` should populate `TenantID` (and optional `BranchID`) — authkit copies these onto the authenticated `User` and uses them for tenant-scoped permission resolution and RLS. See [Multi-Tenancy](#multi-tenancy).
 
 ### Password policy
 
@@ -377,6 +388,20 @@ The callback URL pattern is always `/auth/{providerName}/callback`, where `provi
 | `POST` | `/auth/login` | `auth.Login` | Password / Both | Authenticates with email+password |
 | `POST` | `/auth/logout` | `auth.Logout` | All | Clears the session |
 | `GET` | `/auth/me` | `auth.Me` | All | Returns the current user as JSON |
+
+### Optional routes (mount when the corresponding feature is enabled)
+
+| Method | Path | Handler | Feature | Description |
+|--------|------|---------|---------|-------------|
+| `POST` | `/auth/2fa/enroll` | `auth.Enroll2FA` | TOTP | Provisions a TOTP secret + recovery codes |
+| `POST` | `/auth/2fa/verify` | `auth.Verify2FA` | TOTP | Completes a pending 2FA login |
+| `GET` | `/auth/csrf` | `auth.CSRFToken` | CSRF | Returns/issues a CSRF token as JSON |
+| `GET` | `/authorize` | `auth.Authorize` | Token layer | PKCE authorization endpoint |
+| `POST` | `/token` | `auth.IssueToken` | Token layer | Exchanges an auth code (+ PKCE verifier) for tokens |
+| `POST` | `/token/refresh` | `auth.RefreshAccessToken` | Token layer | Rotates a refresh token for a new pair |
+| `GET` | `/.well-known/jwks.json` | `auth.JWKS` | Token layer | Publishes the Ed25519 verification keys |
+| `POST` | `/platform/login` | `auth.PlatformLogin` | Platform admin | Platform super-admin login (password + TOTP) |
+| `POST` | `/platform/logout` | `auth.PlatformLogout` | Platform admin | Ends the platform session |
 
 `/auth/me` example response:
 
@@ -719,9 +744,11 @@ If neither YAML nor the layered approach fits your needs, implement the `PolicyP
 ```go
 type PolicyProvider interface {
     RoleFor(ctx context.Context, email string) (role string, permissions []string)
-    PermissionsForRole(role string) []string
+    PermissionsForRole(ctx context.Context, role string) []string
 }
 ```
+
+> **Tenant-aware resolution:** both methods receive a `context.Context` carrying the tenant (read it with `authkit.TenantIDFromCtx(ctx)`), so a DB-backed provider can scope role definitions per tenant. `PermissionsForRole` taking a `ctx` is required for API-key and live per-request resolution.
 
 Pass your implementation via `RBACConfig.Provider`:
 
@@ -738,6 +765,337 @@ type PolicyReloader interface {
     Reload() error
 }
 ```
+
+---
+
+## Multi-Tenancy
+
+Every authenticated principal carries a `TenantID` (and optional `BranchID`), making authkit suitable for multi-tenant SaaS where data is isolated per tenant (e.g. Postgres Row-Level Security).
+
+```go
+type User struct {
+    Email     string
+    Name      string
+    AvatarURL string
+    Provider  string
+    Role      string
+    TenantID  string // the hard security boundary
+    BranchID  string // optional in-tenant scope (a row filter, not a permission)
+    // ...
+}
+```
+
+- **Where it comes from:** your `UserStore` (`PasswordUser.TenantID`/`BranchID`), the OAuth callback mapping, or the `APIKeyValidator` populate it. Email is global, so the lookup determines the tenant.
+- **How authkit uses it:** before resolving permissions, authkit puts the tenant on the request context via `WithTenant`. Read it in your handlers and DB layer:
+
+  ```go
+  func handler(w http.ResponseWriter, r *http.Request) {
+      tenantID, ok := authkit.TenantIDFromCtx(r.Context())
+      if !ok {
+          http.Error(w, "no tenant", http.StatusForbidden) // fail closed
+          return
+      }
+      // e.g. set the per-transaction RLS GUC to tenantID before querying.
+  }
+  ```
+
+- **Fail-closed:** `TenantIDFromCtx` returns `ok == false` for an empty/unset tenant — treat that as a hard deny.
+- A tenant-aware `PolicyProvider` reads the same context to resolve roles per tenant (see [Database-backed RBAC](#database-backed-rbac)).
+
+---
+
+## Server-Side Sessions
+
+By default authkit stores the session in an encrypted cookie (stateless). For instant revocation and "log out everywhere", provide a `SessionStore` — the cookie then carries only an opaque session ID and all identity state lives in your store (DB or Redis).
+
+```go
+type SessionStore interface {
+    Create(ctx context.Context, s *authkit.Session) error
+    Get(ctx context.Context, id string) (*authkit.Session, error)
+    Touch(ctx context.Context, id string, lastSeen time.Time) error
+    Revoke(ctx context.Context, id string) error
+    RevokeAllForUser(ctx context.Context, tenantID, email string) error
+}
+```
+
+```go
+auth, err := authkit.New(authkit.Config{
+    SessionStore:    myStore,           // implements authkit.SessionStore
+    IdleTimeout:     30 * time.Minute,  // sliding; default 30m
+    AbsoluteTimeout: 24 * time.Hour,    // hard cap; default 24h
+    // ...
+})
+```
+
+- **Session fixation prevention:** a fresh session ID is minted on every login; any prior session is revoked.
+- **Sliding idle renewal:** `LastSeenAt` is advanced at most once per minute (throttled writes).
+- **`__Host-` cookie prefix** is used when `SecureCookie` is true.
+- **Log out everywhere** (e.g. on password reset or firing an employee):
+
+  ```go
+  err := auth.RevokeUserSessions(ctx, tenantID, "bob@example.com")
+  ```
+
+  `ctx` must carry the user's tenant. No-op when no `SessionStore` is configured.
+
+> The token layer, platform admin, and 2FA features require a `SessionStore` for their session/revocation semantics.
+
+---
+
+## Two-Factor Authentication (TOTP)
+
+Enforce a second factor for sensitive roles. After the password step, users whose role is in `Require2FAForRoles` must complete a TOTP challenge (authenticator app) before a session is minted.
+
+```go
+type TOTPStore interface {
+    Enroll(ctx context.Context, tenantID, email, secret string, recoveryCodeHashes []string) error
+    Secret(ctx context.Context, tenantID, email string) (secret string, enrolled bool, err error)
+    ConsumeRecovery(ctx context.Context, tenantID, email, codeHash string) (bool, error)
+}
+```
+
+```go
+auth, err := authkit.New(authkit.Config{
+    TOTPStore:          myTOTPStore,                  // implements authkit.TOTPStore
+    Require2FAForRoles: []string{"owner", "manager"}, // which roles must complete 2FA
+    AppName:            "Acme",                       // issuer shown in authenticator apps
+    Throttler:          myThrottler,                  // recommended — throttles 2FA attempts too
+    // ...
+})
+
+mux.HandleFunc("POST /auth/2fa/enroll", auth.Enroll2FA)
+mux.HandleFunc("POST /auth/2fa/verify", auth.Verify2FA)
+```
+
+**Flow:**
+
+1. `POST /auth/login` with a 2FA-required role responds `{"status":"2fa_required","action":"enroll"|"verify"}` and sets a short-lived (5 min) pending cookie instead of a session.
+2. If `action == "enroll"`, call `POST /auth/2fa/enroll` to get an `otpauthUrl` (render as a QR code), the raw `secret`, and one-time `recoveryCodes` to display once.
+3. `POST /auth/2fa/verify` with form value `code` (6-digit TOTP) **or** `recovery_code` completes the login and establishes the session.
+
+- The host store is responsible for **encrypting the secret at rest** — authkit passes plaintext at the interface boundary.
+- Recovery codes are single-use; authkit stores only SHA-256 hashes and `ConsumeRecovery` must mark them used atomically.
+- `Enroll2FA` also works for voluntary enrollment from an already-authenticated session.
+
+---
+
+## Mobile Token Layer (OAuth2 + PKCE)
+
+For native/mobile clients, authkit can issue Ed25519-signed access JWTs and rotating opaque refresh tokens via the OAuth2 Authorization Code flow with PKCE.
+
+```go
+signing, _ := authkit.NewSigningKey("key-2026-01", seed) // seed is 32 random bytes
+
+auth, err := authkit.New(authkit.Config{
+    EnableTokens:      true,
+    SigningKeys:       []authkit.SigningKey{signing}, // first key signs; all verify (key rotation)
+    RefreshTokenStore: myRefreshStore,                // implements authkit.RefreshTokenStore
+    AccessTokenTTL:    15 * time.Minute,              // default 15m
+    RefreshTokenTTL:   30 * 24 * time.Hour,           // default 30d
+    TokenIssuer:       "https://api.example.com",     // JWT `iss`
+    TokenClientID:     "mobile-app",                  // public client id + JWT audience
+    TokenRedirectURIs: []string{"acme://callback"},   // allowed PKCE redirect URIs
+    // ...
+})
+
+mux.HandleFunc("GET  /authorize",              auth.Authorize)
+mux.HandleFunc("POST /token",                  auth.IssueToken)
+mux.HandleFunc("POST /token/refresh",          auth.RefreshAccessToken)
+mux.HandleFunc("GET  /.well-known/jwks.json",  auth.JWKS)
+```
+
+```go
+type RefreshTokenStore interface {
+    Create(ctx context.Context, t *authkit.RefreshToken) error
+    Get(ctx context.Context, rawToken string) (*authkit.RefreshToken, error)
+    Rotate(ctx context.Context, rawOld string, next *authkit.RefreshToken) error
+    RevokeChain(ctx context.Context, chainID string) error
+}
+```
+
+**Flow:**
+
+1. The app opens `GET /authorize?response_type=code&client_id=...&redirect_uri=...&code_challenge=...&code_challenge_method=S256` in the system browser. The user must already have a web session (the browser carries the cookie); otherwise they are bounced to login.
+2. authkit redirects back to `redirect_uri?code=...`. The app calls `POST /token` with `grant_type=authorization_code`, `code`, `code_verifier`, and `redirect_uri` to receive `{access_token, refresh_token, token_type, expires_in}`.
+3. The app calls protected APIs with `Authorization: Bearer <access_token>`. `Require`/`RequireAuth` verify the JWT against the JWKS.
+4. `POST /token/refresh` with `refresh_token` rotates the pair.
+
+**Security properties:**
+
+- **Permissions are never in the JWT** — they're resolved server-side per request, so role/permission changes take effect within one access-token TTL.
+- **Refresh-token rotation with reuse detection:** presenting an already-used or revoked refresh token revokes the entire chain (theft response) and emits an audit `revoke` event.
+- **Refresh tokens are opaque**; the store must hash them at rest.
+- **Key rotation:** the first `SigningKey` signs; all keys verify and are published via JWKS, so a key can be retired without invalidating tokens it already signed.
+
+---
+
+## Platform Super-Admin
+
+A platform principal is a SaaS operator acting across tenants — a separate axis from tenant RBAC, with **no `TenantID`**. Platform login requires password **and** mandatory TOTP, and uses its own cookie (never crosses with tenant sessions).
+
+```go
+type PlatformAdminStore interface {
+    GetPlatformAdmin(ctx context.Context, email string) (*authkit.PlatformAdminRecord, error)
+}
+
+type PlatformPolicy interface {
+    PermissionsForPlatformRole(role string) []string // small static capability catalog
+}
+```
+
+```go
+auth, err := authkit.New(authkit.Config{
+    SessionStore:        myStore, // required for platform sessions
+    PlatformAdminStore:  myPlatformStore,
+    PlatformPolicy:      myPlatformPolicy,
+    EnableImpersonation: true, // gates break-glass single-tenant access
+    // ...
+})
+
+mux.HandleFunc("POST /platform/login",  auth.PlatformLogin)  // form: email, password, code
+mux.HandleFunc("POST /platform/logout", auth.PlatformLogout)
+
+// Protect platform routes with a platform capability check:
+mux.Handle("GET /platform/tenants",
+    auth.RequirePlatformAdmin("platform:tenants.read")(http.HandlerFunc(listTenants)))
+```
+
+- Read the principal inside a handler with `authkit.PlatformAdminFromCtx(r.Context())`.
+- `RequirePlatformAdmin` **never** sets a tenant GUC — a platform admin's DB role has no cross-tenant bypass.
+- **Break-glass impersonation** lets an admin act within exactly one tenant; it requires the `platform:impersonate` capability and is audited:
+
+  ```go
+  ctx, err := auth.ImpersonationContext(r.Context(), admin, tenantID)
+  // ctx is now tenant-scoped; downstream queries run under normal RLS for that one tenant.
+  ```
+
+---
+
+## Device Principals
+
+A device principal is a headless print agent (not a human) confined to a fixed, tiny capability set defined in code — it can receive print jobs and report status, and **nothing else** in the API. It is a separate credential path from the human/API-key flow.
+
+```go
+type DeviceTokenValidator interface {
+    ValidateDeviceToken(ctx context.Context, rawToken string) (*authkit.DeviceRecord, error)
+}
+```
+
+```go
+auth, err := authkit.New(authkit.Config{
+    DeviceTokenValidator: myDeviceValidator,
+    // ...
+})
+
+// Fixed device capabilities (the whole of what a device may ever do):
+//   authkit.CapPrintJobReceive   = "print:job.receive"
+//   authkit.CapPrintStatusReport = "print:status.report"
+mux.Handle("GET /agent/jobs",
+    auth.RequireDevice(authkit.CapPrintJobReceive)(http.HandlerFunc(jobsHandler)))
+```
+
+- The device presents an opaque token via `Authorization: Bearer` / `X-API-Key`; the store hashes it at rest and looks it up pre-tenant.
+- On success, `RequireDevice` binds the device's tenant **and** branch on the context. Read the principal with `authkit.DeviceFromCtx(ctx)`.
+- A device never resolves permissions from a policy — it can never hold `"*"` or any tenant capability.
+- `RequireDevice` **panics at startup** if given a non-device capability (a wiring mistake caught early). `AuthenticateDevice` is also exposed for non-HTTP paths (e.g. a WebSocket upgrade).
+
+---
+
+## CSRF Protection
+
+For cookie-authenticated SPAs, enable signed double-submit CSRF protection. Token-authenticated requests (Bearer / API key) carry no ambient cookie credential and are always exempt.
+
+```go
+auth, err := authkit.New(authkit.Config{
+    EnableCSRF: true,
+    // ...
+})
+
+// Wrap state-changing, cookie-authenticated routes:
+mux.Handle("POST /api/projects", auth.CSRF(auth.Require("projects:write")(createHandler)))
+
+// Optional explicit token endpoint for SPAs that fetch it:
+mux.HandleFunc("GET /auth/csrf", auth.CSRFToken)
+```
+
+- The token is delivered in a JS-readable cookie and must be echoed back in the `X-CSRF-Token` header on unsafe methods (`POST`/`PUT`/`PATCH`/`DELETE`).
+- The server checks both that the header matches the cookie **and** that the token carries a valid HMAC (signed with `SessionSecret`), so a subdomain that can set cookies still can't forge a signed token.
+- Safe methods (`GET`/`HEAD`/`OPTIONS`/`TRACE`) pass through and bootstrap the cookie.
+
+---
+
+## Login Throttling
+
+Blunt brute-force and credential-stuffing attacks by plugging in a rate limiter (e.g. backed by Redis). authkit calls it around password login, 2FA verification, and platform login, keyed per account+IP.
+
+```go
+type LoginThrottler interface {
+    Allow(ctx context.Context, key string) (retryAfter time.Duration, ok bool)
+    RecordFailure(ctx context.Context, key string) error
+    Reset(ctx context.Context, key string) error
+}
+```
+
+```go
+auth, err := authkit.New(authkit.Config{
+    Throttler: myThrottler, // implements authkit.LoginThrottler
+    // ...
+})
+```
+
+- When locked out, authkit responds `429 Too Many Requests` with a `Retry-After` header.
+- A successful login calls `Reset` to clear the failure counter.
+- authkit uses `RemoteAddr` for the client IP and **does not** trust `X-Forwarded-For` — behind a proxy, set `RemoteAddr` from a vetted header before authkit sees the request.
+
+---
+
+## Live Permission Resolution
+
+By default a session's permissions are resolved once at login and cached in the session, so role changes take effect on next login. Enable `LivePermissionResolution` to re-resolve permissions from the `PolicyProvider` on every request, through a short TTL cache — useful for multi-tenant deployments where operators change roles at runtime.
+
+```go
+auth, err := authkit.New(authkit.Config{
+    LivePermissionResolution: true,
+    PermissionCacheTTL:       30 * time.Second, // default 30s
+    // ...
+})
+```
+
+- API-key and token (JWT) credentials **always** resolve live, regardless of this flag.
+- Leave it off for single-shop deployments to keep the cheaper login-time cache.
+
+---
+
+## Audit Events
+
+Wire an `AuditSink` to persist structured security events to your audit log.
+
+```go
+type AuditSink interface {
+    Emit(ctx context.Context, ev authkit.AuditEvent)
+}
+
+type AuditEvent struct {
+    Type     string // see constants below
+    TenantID string
+    Actor    string // who performed the action
+    Subject  string // who/what it acted on
+    IP       string
+    At       time.Time
+    Meta     map[string]any
+}
+```
+
+```go
+auth, err := authkit.New(authkit.Config{
+    AuditSink: myAuditSink, // defaults to a no-op sink when nil
+    // ...
+})
+```
+
+Well-known event types: `AuditLogin`, `AuditLogout`, `AuditRefresh`, `AuditRevoke`, `Audit2FAEnroll`, `Audit2FAVerify`, `AuditRoleChange`, `AuditPermissionChange`, `AuditImpersonate`.
+
+> **Don't block the request path** — implementations must buffer or hand off slow I/O. `Emit` is best-effort and never returns an error to authkit.
 
 ---
 
@@ -811,12 +1169,56 @@ authkit.Config{
     // When set, Require/RequireAuth accept Bearer tokens validated by this.
     // RequireSession/RequireSessionAuth always reject API keys regardless.
     APIKeyValidator: myKeyStore, // implements authkit.APIKeyValidator
+
+    // Optional: structured security audit events. Default: no-op sink.
+    AuditSink: myAuditSink, // implements authkit.AuditSink
+
+    // Optional: re-resolve session permissions per request (TTL-cached).
+    // Default: false (resolve once at login). PermissionCacheTTL default: 30s.
+    LivePermissionResolution: true,
+    PermissionCacheTTL:       30 * time.Second,
+
+    // Optional: revocable server-side sessions. When nil, encrypted cookie sessions.
+    SessionStore:    myStore,          // implements authkit.SessionStore
+    IdleTimeout:     30 * time.Minute, // sliding; default 30m
+    AbsoluteTimeout: 24 * time.Hour,   // hard cap; default 24h
+
+    // Optional: CSRF double-submit middleware for cookie auth.
+    EnableCSRF: true,
+
+    // Optional: per-account+IP login rate limiting.
+    Throttler: myThrottler, // implements authkit.LoginThrottler
+
+    // Optional: two-factor auth (TOTP).
+    TOTPStore:          myTOTPStore, // implements authkit.TOTPStore
+    Require2FAForRoles: []string{"owner", "manager"},
+    AppName:            "Acme", // issuer shown in authenticator apps; default "App"
+
+    // Optional: mobile token layer (OAuth2 + PKCE + Ed25519 JWTs).
+    EnableTokens:      true,
+    SigningKeys:       []authkit.SigningKey{signingKey},
+    RefreshTokenStore: myRefreshStore, // implements authkit.RefreshTokenStore
+    AccessTokenTTL:    15 * time.Minute,    // default 15m
+    RefreshTokenTTL:   30 * 24 * time.Hour, // default 30d
+    TokenIssuer:       "https://api.example.com",
+    TokenClientID:     "mobile-app",
+    TokenRedirectURIs: []string{"acme://callback"},
+
+    // Optional: platform super-admin axis + break-glass impersonation.
+    PlatformAdminStore:  myPlatformStore,  // implements authkit.PlatformAdminStore
+    PlatformPolicy:      myPlatformPolicy, // implements authkit.PlatformPolicy
+    EnableImpersonation: true,
+
+    // Optional: device principals (confined print agents).
+    DeviceTokenValidator: myDeviceValidator, // implements authkit.DeviceTokenValidator
 }
 ```
 
 ---
 
 ## Session Security
+
+By default, sessions are stored in encrypted cookies (stateless). For revocable, server-side sessions with idle/absolute timeouts and "log out everywhere", see [Server-Side Sessions](#server-side-sessions).
 
 - Sessions are stored in **encrypted, signed cookies** (`gorilla/sessions` + `securecookie`).
 - Cookie flags: `HttpOnly`, `SameSite=Lax`, 7-day `MaxAge`.
