@@ -13,8 +13,8 @@ import (
 
 func TestNew_ShortSecret_ReturnsError(t *testing.T) {
 	_, err := New(Config{
-		SessionSecret: "too-short",
-		Providers:     []ProviderConfig{{Name: "github", ClientID: "id", ClientSecret: "s"}},
+		SessionSecret:   "too-short",
+		Providers:       []ProviderConfig{{Name: "github", ClientID: "id", ClientSecret: "s"}},
 		CallbackBaseURL: "https://example.com",
 	})
 	if err == nil {

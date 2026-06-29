@@ -22,6 +22,12 @@ type UserStore interface {
 	// GetUserByEmail retrieves a user by email. Returns ErrUserNotFound if
 	// no user matches.
 	GetUserByEmail(ctx context.Context, email string) (*PasswordUser, error)
+
+	// UpdatePassword sets the bcrypt-hashed password for the user with this
+	// (global) email. Called by the password-reset flow after a valid token is
+	// consumed. ctx carries the user's tenant, so a tenant-scoped store can run
+	// the update under RLS.
+	UpdatePassword(ctx context.Context, email, hashedPassword string) error
 }
 
 // PasswordUser is the record returned by UserStore.GetUserByEmail.

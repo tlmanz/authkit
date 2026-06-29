@@ -74,6 +74,7 @@ func (stubUserStore) CreateUser(context.Context, string, string, string) error {
 func (stubUserStore) GetUserByEmail(context.Context, string) (*PasswordUser, error) {
 	return nil, ErrUserNotFound
 }
+func (stubUserStore) UpdatePassword(context.Context, string, string) error { return nil }
 
 func newServerSessionAuth(t *testing.T, store SessionStore) *Auth {
 	t.Helper()

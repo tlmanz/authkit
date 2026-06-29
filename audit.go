@@ -35,6 +35,11 @@ const (
 	AuditRoleChange       = "role_change"
 	AuditPermissionChange = "permission_change"
 	AuditImpersonate      = "impersonate"
+
+	// Password reset: a recovery token was requested, and (later) a password was
+	// actually changed via a consumed token.
+	AuditPasswordResetRequest = "password_reset_request"
+	AuditPasswordReset        = "password_reset"
 )
 
 // AuditSink receives audit events. Implementations MUST NOT block the request

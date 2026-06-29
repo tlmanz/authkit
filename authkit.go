@@ -222,6 +222,15 @@ type Config struct {
 	PlatformPolicy      PlatformPolicy
 	EnableImpersonation bool
 
+	// ── Password reset (§6, "Forget Password") ────────────────────────────
+	// PasswordResetStore persists single-use, hashed reset tokens; ResetDelivery
+	// sends the raw token out-of-band (email/SMS). Both are required to enable the
+	// ForgotPassword/ResetPassword (and platform) handlers. PasswordResetTTL bounds
+	// a token's validity (default 30m).
+	PasswordResetStore PasswordResetStore
+	ResetDelivery      ResetDelivery
+	PasswordResetTTL   time.Duration
+
 	// ── Device principals / print agents (§7.12) ──────────────────────────
 	// DeviceTokenValidator enables the device principal axis (print agents).
 	// When set, RequireDevice and AuthenticateDevice validate opaque device
@@ -235,12 +244,12 @@ type Config struct {
 // Auth is the central object. Create one with New() and attach its methods as
 // HTTP handlers and middleware.
 type Auth struct {
-	cfg          Config
-	store        sessions.Store
-	rbacProvider PolicyProvider
-	log          Logger
-	keyValidator APIKeyValidator
-	audit        AuditSink
+	cfg             Config
+	store           sessions.Store
+	rbacProvider    PolicyProvider
+	log             Logger
+	keyValidator    APIKeyValidator
+	audit           AuditSink
 	permCache       *permCache
 	throttler       LoginThrottler
 	keyring         *keyring

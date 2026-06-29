@@ -24,6 +24,14 @@ func (m *memPlatformStore) GetPlatformAdmin(_ context.Context, email string) (*P
 	return m.rec, nil
 }
 
+func (m *memPlatformStore) UpdatePassword(_ context.Context, email, hashed string) error {
+	if m.rec == nil || !strings.EqualFold(email, m.rec.Email) {
+		return ErrUserNotFound
+	}
+	m.rec.HashedPassword = hashed
+	return nil
+}
+
 type staticPlatformPolicy struct{}
 
 func (staticPlatformPolicy) PermissionsForPlatformRole(role string) []string {
@@ -80,41 +88,97 @@ func platformAuth(t *testing.T, role string, audit AuditSink) *Auth {
 	return a
 }
 
-func platformLogin(t *testing.T, a *Auth) *http.Cookie {
+// platformPasswordStep posts step 1 (email + password) and returns the recorder.
+func platformPasswordStep(t *testing.T, a *Auth, password string) *httptest.ResponseRecorder {
 	t.Helper()
-	code, _ := totp.GenerateCode(platformTOTPSecret, time.Now())
 	rec := httptest.NewRecorder()
-	form := url.Values{"email": {"root@klutch.lk"}, "password": {"super-secret-pw"}, "code": {code}}
+	form := url.Values{"email": {"root@klutch.lk"}, "password": {password}}
 	req := httptest.NewRequest("POST", "/platform/login", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.RemoteAddr = "10.0.0.9:5555"
 	a.PlatformLogin(rec, req)
+	return rec
+}
+
+// platformLogin runs the full two-step flow (password → TOTP) and returns the
+// platform session cookie.
+func platformLogin(t *testing.T, a *Auth) *http.Cookie {
+	t.Helper()
+	rec := platformPasswordStep(t, a, "super-secret-pw")
 	if rec.Code != http.StatusOK {
-		t.Fatalf("platform login = %d, want 200; body=%s", rec.Code, rec.Body.String())
+		t.Fatalf("platform login step1 = %d, want 200; body=%s", rec.Code, rec.Body.String())
 	}
-	c := findCookie(rec, a.platformCookieName())
+	pending := findCookie(rec, a.platformPendingCookieName())
+	if pending == nil {
+		t.Fatal("no platform pending cookie after password step")
+	}
+
+	code, _ := totp.GenerateCode(platformTOTPSecret, time.Now())
+	rec2 := httptest.NewRecorder()
+	form := url.Values{"code": {code}}
+	req := httptest.NewRequest("POST", "/platform/2fa/verify", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.RemoteAddr = "10.0.0.9:5555"
+	req.AddCookie(pending)
+	a.PlatformVerify2FA(rec2, req)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("platform verify step2 = %d, want 200; body=%s", rec2.Code, rec2.Body.String())
+	}
+	c := findCookie(rec2, a.platformCookieName())
 	if c == nil {
-		t.Fatal("no platform cookie issued")
+		t.Fatal("no platform session cookie issued")
 	}
 	return c
 }
 
-func TestPlatformLogin_RequiresPasswordAndTOTP(t *testing.T) {
+func TestPlatformLogin_TwoStepPasswordThenTOTP(t *testing.T) {
 	audit := &capturingAudit{}
 	a := platformAuth(t, "super_admin", audit)
 
-	// Wrong TOTP → 401.
-	rec := httptest.NewRecorder()
-	form := url.Values{"email": {"root@klutch.lk"}, "password": {"super-secret-pw"}, "code": {"000000"}}
-	req := httptest.NewRequest("POST", "/platform/login", strings.NewReader(form.Encode()))
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.RemoteAddr = "10.0.0.9:5555"
-	a.PlatformLogin(rec, req)
+	// Wrong password → step 1 401, no pending cookie, no session.
+	rec := platformPasswordStep(t, a, "wrong-pw")
 	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("login with bad TOTP = %d, want 401", rec.Code)
+		t.Fatalf("bad password = %d, want 401", rec.Code)
+	}
+	if findCookie(rec, a.platformPendingCookieName()) != nil {
+		t.Fatal("pending cookie issued for a wrong password")
 	}
 
-	// Correct password + TOTP → 200 + audit login.
+	// Correct password → step 1 200 (2fa_required) + pending cookie.
+	rec = platformPasswordStep(t, a, "super-secret-pw")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("good password step1 = %d, want 200", rec.Code)
+	}
+	pending := findCookie(rec, a.platformPendingCookieName())
+	if pending == nil {
+		t.Fatal("no pending cookie after correct password")
+	}
+	if findCookie(rec, a.platformCookieName()) != nil {
+		t.Fatal("session minted before TOTP step")
+	}
+
+	// Wrong TOTP at step 2 → 401, no session.
+	rec2 := httptest.NewRecorder()
+	form := url.Values{"code": {"000000"}}
+	req := httptest.NewRequest("POST", "/platform/2fa/verify", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.RemoteAddr = "10.0.0.9:5555"
+	req.AddCookie(pending)
+	a.PlatformVerify2FA(rec2, req)
+	if rec2.Code != http.StatusUnauthorized {
+		t.Fatalf("bad TOTP = %d, want 401", rec2.Code)
+	}
+
+	// Verify with no pending cookie → 401.
+	rec3 := httptest.NewRecorder()
+	req3 := httptest.NewRequest("POST", "/platform/2fa/verify", strings.NewReader(form.Encode()))
+	req3.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	a.PlatformVerify2FA(rec3, req3)
+	if rec3.Code != http.StatusUnauthorized {
+		t.Fatalf("verify without pending = %d, want 401", rec3.Code)
+	}
+
+	// Full correct flow → 200 + audit login.
 	platformLogin(t, a)
 	if audit.count(AuditLogin) < 1 {
 		t.Fatal("expected an audit login event")

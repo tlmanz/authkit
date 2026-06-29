@@ -2,6 +2,9 @@ package authkit
 
 import (
 	"context"
+	"crypto/subtle"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
@@ -10,6 +13,64 @@ import (
 	"github.com/pquerna/otp/totp"
 	"golang.org/x/crypto/bcrypt"
 )
+
+const platformPendingCookieNm = "authkit_padmin_pending"
+
+func (a *Auth) platformPendingCookieName() string {
+	if a.cfg.SecureCookie {
+		return "__Host-" + platformPendingCookieNm
+	}
+	return platformPendingCookieNm
+}
+
+// issuePlatformPendingToken mints a short-lived signed token proving a platform
+// admin passed the password step and is awaiting the TOTP step. The "padmin:"
+// signing prefix namespaces it from the tenant 2FA pending token, so neither can
+// be replayed against the other's verify endpoint.
+func (a *Auth) issuePlatformPendingToken(email string) string {
+	c := pendingClaims{Email: email, Exp: nowFn().Add(twofaPendingTTL).Unix()}
+	j, _ := json.Marshal(c)
+	payload := base64.RawURLEncoding.EncodeToString(j)
+	return payload + "." + a.sign("padmin:"+payload)
+}
+
+func (a *Auth) readPlatformPending(r *http.Request) (string, bool) {
+	c, err := r.Cookie(a.platformPendingCookieName())
+	if err != nil {
+		return "", false
+	}
+	payload, mac, ok := strings.Cut(c.Value, ".")
+	if !ok || subtle.ConstantTimeCompare([]byte(mac), []byte(a.sign("padmin:"+payload))) != 1 {
+		return "", false
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(payload)
+	if err != nil {
+		return "", false
+	}
+	var cl pendingClaims
+	if err := json.Unmarshal(raw, &cl); err != nil || cl.Email == "" {
+		return "", false
+	}
+	if nowFn().Unix() > cl.Exp {
+		return "", false
+	}
+	return cl.Email, true
+}
+
+func (a *Auth) setPlatformPendingCookie(w http.ResponseWriter, token string) {
+	http.SetCookie(w, &http.Cookie{
+		Name: a.platformPendingCookieName(), Value: token, Path: "/",
+		HttpOnly: true, Secure: a.cfg.SecureCookie, SameSite: http.SameSiteLaxMode,
+		MaxAge: int(twofaPendingTTL / time.Second),
+	})
+}
+
+func (a *Auth) clearPlatformPendingCookie(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{
+		Name: a.platformPendingCookieName(), Value: "", Path: "/",
+		HttpOnly: true, Secure: a.cfg.SecureCookie, SameSite: http.SameSiteLaxMode, MaxAge: -1,
+	})
+}
 
 // Sentinel errors for impersonation.
 var (
@@ -67,6 +128,12 @@ type PlatformAdminRecord struct {
 // PlatformAdminStore looks up platform admins (separate from UserStore).
 type PlatformAdminStore interface {
 	GetPlatformAdmin(ctx context.Context, email string) (*PlatformAdminRecord, error)
+
+	// UpdatePassword sets the bcrypt-hashed password for the platform admin with
+	// this email. Called by the platform password-reset flow; it does NOT touch
+	// the TOTP secret (2FA stays mandatory). Runs on the pool — platform_admins
+	// has no RLS.
+	UpdatePassword(ctx context.Context, email, hashedPassword string) error
 }
 
 // PlatformPolicy maps a platform role to its capabilities (a small, static
@@ -82,9 +149,11 @@ func (a *Auth) platformCookieName() string {
 	return "authkit_padmin"
 }
 
-// PlatformLogin authenticates a platform admin (password + mandatory TOTP) and
-// establishes a platform session. Mount on a separate route/subdomain:
-// POST /platform/login. Expects form values: email, password, code.
+// PlatformLogin is step ONE of platform login: it verifies the email + password
+// and, only on success, starts the mandatory TOTP challenge (no role exemption).
+// It does NOT mint a session — the client must then call PlatformVerify2FA with
+// the code. Mount on a separate route/subdomain: POST /platform/login. Expects
+// form values: email, password.
 func (a *Auth) PlatformLogin(w http.ResponseWriter, r *http.Request) {
 	if a.cfg.PlatformAdminStore == nil {
 		http.Error(w, "platform admin not enabled", http.StatusNotFound)
@@ -92,7 +161,6 @@ func (a *Auth) PlatformLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	email := strings.ToLower(strings.TrimSpace(r.FormValue("email")))
 	password := r.FormValue("password")
-	code := strings.TrimSpace(r.FormValue("code"))
 
 	tkey := throttleKey("platform:"+email, clientIP(r))
 	if !a.throttleAllow(w, r, tkey) {
@@ -102,19 +170,59 @@ func (a *Auth) PlatformLogin(w http.ResponseWriter, r *http.Request) {
 	rec, err := a.cfg.PlatformAdminStore.GetPlatformAdmin(r.Context(), email)
 	if err != nil {
 		_ = bcrypt.CompareHashAndPassword(dummyHash, []byte(password))
-		a.throttleFailure(r.Context(), tkey)
-		a.emitAudit(r.Context(), AuditEvent{Type: AuditLogin, Actor: email, IP: clientIP(r), At: nowFn(), Meta: map[string]any{"platform": true, "result": "fail"}})
+		a.platformLoginFail(r, tkey, email)
 		http.Error(w, "invalid credentials", http.StatusUnauthorized)
 		return
 	}
-	// Password + mandatory TOTP (no role exemption for platform admins).
-	if !CheckPassword(rec.HashedPassword, password) || rec.TOTPSecret == "" || !totp.Validate(code, rec.TOTPSecret) {
-		a.throttleFailure(r.Context(), tkey)
-		a.emitAudit(r.Context(), AuditEvent{Type: AuditLogin, Actor: email, IP: clientIP(r), At: nowFn(), Meta: map[string]any{"platform": true, "result": "fail"}})
+	// Password must be correct AND the admin must have TOTP enrolled (always true
+	// after bootstrap) before we reveal the second step.
+	if !CheckPassword(rec.HashedPassword, password) || rec.TOTPSecret == "" {
+		a.platformLoginFail(r, tkey, email)
 		http.Error(w, "invalid credentials", http.StatusUnauthorized)
+		return
+	}
+
+	// Password correct → arm the TOTP step. Throttle is reset only on full success.
+	a.setPlatformPendingCookie(w, a.issuePlatformPendingToken(email))
+	writeJSON(w, http.StatusOK, map[string]string{"status": "2fa_required"})
+}
+
+func (a *Auth) platformLoginFail(r *http.Request, tkey, email string) {
+	a.throttleFailure(r.Context(), tkey)
+	a.emitAudit(r.Context(), AuditEvent{Type: AuditLogin, Actor: email, IP: clientIP(r), At: nowFn(), Meta: map[string]any{"platform": true, "result": "fail"}})
+}
+
+// PlatformVerify2FA is step TWO: it validates the TOTP code for the admin in the
+// platform-pending state (password already verified) and, on success, establishes
+// the platform session. Mount on: POST /platform/2fa/verify. Expects form: code.
+func (a *Auth) PlatformVerify2FA(w http.ResponseWriter, r *http.Request) {
+	if a.cfg.PlatformAdminStore == nil {
+		http.Error(w, "platform admin not enabled", http.StatusNotFound)
+		return
+	}
+	email, ok := a.readPlatformPending(r)
+	if !ok {
+		http.Error(w, "no pending platform challenge", http.StatusUnauthorized)
+		return
+	}
+	tkey := throttleKey("platform:"+email, clientIP(r))
+	if !a.throttleAllow(w, r, tkey) {
+		return
+	}
+
+	rec, err := a.cfg.PlatformAdminStore.GetPlatformAdmin(r.Context(), email)
+	if err != nil {
+		http.Error(w, "invalid challenge", http.StatusUnauthorized)
+		return
+	}
+	code := strings.TrimSpace(r.FormValue("code"))
+	if rec.TOTPSecret == "" || !totp.Validate(code, rec.TOTPSecret) {
+		a.platformLoginFail(r, tkey, email)
+		http.Error(w, "invalid code", http.StatusUnauthorized)
 		return
 	}
 	a.throttleReset(r.Context(), tkey)
+	a.clearPlatformPendingCookie(w)
 
 	if err := a.establishPlatformSession(r.Context(), w, r, rec); err != nil {
 		a.log.Error("authkit: platform session error: %v", err)
@@ -173,6 +281,28 @@ func (a *Auth) platformEmail(r *http.Request) string {
 		return p.Email
 	}
 	return ""
+}
+
+// PlatformMe returns the currently signed-in platform admin (from the platform
+// session cookie), or 401 when there is none. It is the platform counterpart to
+// Me, letting an SPA confirm the platform session and show who is logged in.
+// Mount on: GET /platform/me
+func (a *Auth) PlatformMe(w http.ResponseWriter, r *http.Request) {
+	if a.cfg.PlatformAdminStore == nil {
+		http.Error(w, "platform admin not enabled", http.StatusNotFound)
+		return
+	}
+	p := a.platformAdminFromSession(r.Context(), r)
+	if p == nil {
+		w.Header().Set("Content-Type", "application/json")
+		http.Error(w, `{"error":"unauthenticated"}`, http.StatusUnauthorized)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"email": p.Email,
+		"name":  p.Name,
+		"role":  p.Role,
+	})
 }
 
 // platformAdminFromSession loads + validates the platform session and resolves

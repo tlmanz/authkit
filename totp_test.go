@@ -53,6 +53,7 @@ func (m *memTOTPStore) ConsumeRecovery(_ context.Context, _, email, hash string)
 type twoFAUserStore struct{}
 
 func (twoFAUserStore) CreateUser(context.Context, string, string, string) error { return nil }
+func (twoFAUserStore) UpdatePassword(context.Context, string, string) error     { return nil }
 func (twoFAUserStore) GetUserByEmail(_ context.Context, email string) (*PasswordUser, error) {
 	if email != "owner@shop.lk" {
 		return nil, ErrUserNotFound

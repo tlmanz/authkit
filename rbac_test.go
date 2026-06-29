@@ -45,9 +45,9 @@ func TestRoleFor_KnownUser(t *testing.T) {
 		wantRole    string
 		wantPermLen int
 	}{
-		{"admin@example.com", "admin", 1},     // ["*"]
-		{"dev@example.com", "developer", 2},   // ["view","upload"]
-		{"guest@example.com", "viewer", 1},    // ["view"]
+		{"admin@example.com", "admin", 1},   // ["*"]
+		{"dev@example.com", "developer", 2}, // ["view","upload"]
+		{"guest@example.com", "viewer", 1},  // ["view"]
 	}
 
 	for _, tt := range tests {

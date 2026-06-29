@@ -29,7 +29,7 @@ func buildAuthWithAPIKey(t *testing.T, u *User, perms []string) *Auth {
 	}
 	return &Auth{
 		store:        store,
-		rbacProvider:         newRBAC(policy),
+		rbacProvider: newRBAC(policy),
 		keyValidator: &mockKeyValidator{user: u},
 	}
 }
@@ -66,7 +66,7 @@ func TestRequireAuth_InvalidAPIKey_NoSession_Returns401(t *testing.T) {
 	store := newCookieStore("middleware-test-secret-32-bytes!!", false)
 	a := &Auth{
 		store:        store,
-		rbacProvider:         &rbac{},
+		rbacProvider: &rbac{},
 		keyValidator: &mockKeyValidator{user: nil}, // validator returns no user
 	}
 

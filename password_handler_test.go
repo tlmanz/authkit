@@ -22,6 +22,9 @@ func (failingUserStore) CreateUser(_ context.Context, _, _, _ string) error {
 func (failingUserStore) GetUserByEmail(_ context.Context, _ string) (*PasswordUser, error) {
 	return nil, fmt.Errorf("database connection failed")
 }
+func (failingUserStore) UpdatePassword(_ context.Context, _, _ string) error {
+	return fmt.Errorf("database connection failed")
+}
 
 type mockUserStore struct {
 	mu    sync.RWMutex
@@ -52,6 +55,17 @@ func (m *mockUserStore) GetUserByEmail(_ context.Context, email string) (*Passwo
 	return u, nil
 }
 
+func (m *mockUserStore) UpdatePassword(_ context.Context, email, hashed string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	u, ok := m.users[email]
+	if !ok {
+		return ErrUserNotFound
+	}
+	u.HashedPassword = hashed
+	return nil
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 const testSecret = "password-handler-test-secret-32b!"
@@ -65,8 +79,8 @@ func buildPasswordAuth(t *testing.T, store *mockUserStore) *Auth {
 			AfterLoginURL: "/dashboard",
 			UserStore:     store,
 		},
-		store: newCookieStore(testSecret, false),
-		rbacProvider:  newRBAC(Policy{}),
+		store:        newCookieStore(testSecret, false),
+		rbacProvider: newRBAC(Policy{}),
 	}
 }
 
@@ -79,8 +93,8 @@ func buildPasswordAuthWithRBAC(t *testing.T, store *mockUserStore, policy Policy
 			AfterLoginURL: "/dashboard",
 			UserStore:     store,
 		},
-		store: newCookieStore(testSecret, false),
-		rbacProvider:  newRBAC(policy),
+		store:        newCookieStore(testSecret, false),
+		rbacProvider: newRBAC(policy),
 	}
 }
 
@@ -467,9 +481,9 @@ func TestRegister_InternalStoreError(t *testing.T) {
 			AfterLoginURL: "/dashboard",
 			UserStore:     failingUserStore{},
 		},
-		store: newCookieStore(testSecret, false),
-		rbacProvider:  newRBAC(Policy{}),
-		log:   defaultLogger{},
+		store:        newCookieStore(testSecret, false),
+		rbacProvider: newRBAC(Policy{}),
+		log:          defaultLogger{},
 	}
 
 	w := httptest.NewRecorder()
@@ -491,9 +505,9 @@ func TestLogin_InternalStoreError(t *testing.T) {
 			AfterLoginURL: "/dashboard",
 			UserStore:     failingUserStore{},
 		},
-		store: newCookieStore(testSecret, false),
-		rbacProvider:  newRBAC(Policy{}),
-		log:   defaultLogger{},
+		store:        newCookieStore(testSecret, false),
+		rbacProvider: newRBAC(Policy{}),
+		log:          defaultLogger{},
 	}
 
 	w := httptest.NewRecorder()
@@ -517,9 +531,9 @@ func TestRegister_BothMode_Works(t *testing.T) {
 			AfterLoginURL: "/dashboard",
 			UserStore:     newMockUserStore(),
 		},
-		store: newCookieStore(testSecret, false),
-		rbacProvider:  newRBAC(Policy{}),
-		log:   defaultLogger{},
+		store:        newCookieStore(testSecret, false),
+		rbacProvider: newRBAC(Policy{}),
+		log:          defaultLogger{},
 	}
 
 	w := httptest.NewRecorder()
@@ -549,9 +563,9 @@ func TestLogin_BothMode_Works(t *testing.T) {
 			AfterLoginURL: "/dashboard",
 			UserStore:     store,
 		},
-		store: newCookieStore(testSecret, false),
-		rbacProvider:  newRBAC(Policy{}),
-		log:   defaultLogger{},
+		store:        newCookieStore(testSecret, false),
+		rbacProvider: newRBAC(Policy{}),
+		log:          defaultLogger{},
 	}
 
 	w := httptest.NewRecorder()
