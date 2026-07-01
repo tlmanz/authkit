@@ -123,7 +123,7 @@ func (a *Auth) IssueResetToken(ctx context.Context, email, name, kind string) (s
 
 // ForgotPassword starts self-service recovery for a tenant user. It ALWAYS
 // responds 200 with the same body whether or not the email exists, leaking
-// nothing about which emails are registered. Mount on: POST /auth/forgot-password.
+// nothing about which emails are registered. Mount on: POST /auth/password/forgot.
 // Expects form: email.
 func (a *Auth) ForgotPassword(w http.ResponseWriter, r *http.Request) {
 	if !a.resetEnabled() {
@@ -145,7 +145,7 @@ func (a *Auth) ForgotPassword(w http.ResponseWriter, r *http.Request) {
 
 // ResetPassword completes self-service recovery: consume a valid reset token,
 // set the new password, and revoke all of the user's sessions. Mount on:
-// POST /auth/reset-password. Expects form: token, password.
+// POST /auth/password/reset. Expects form: token, password.
 func (a *Auth) ResetPassword(w http.ResponseWriter, r *http.Request) {
 	if a.cfg.PasswordResetStore == nil {
 		http.Error(w, "password reset not enabled", http.StatusNotFound)
@@ -183,17 +183,18 @@ func (a *Auth) ResetPassword(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	// A credential change invalidates every existing session.
+	// A credential change invalidates every existing session + trusted device.
 	if a.cfg.SessionStore != nil {
 		_ = a.cfg.SessionStore.RevokeAllForUser(ctx, u.TenantID, email)
 	}
+	a.revokeTrustedDevices(ctx, u.TenantID, email)
 	a.emitAudit(ctx, AuditEvent{Type: AuditPasswordReset, TenantID: u.TenantID, Actor: email, Subject: email, IP: clientIP(r), At: nowFn()})
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 // PlatformForgotPassword starts self-service recovery for a platform admin.
 // Same no-enumeration contract as ForgotPassword. Mount on:
-// POST /platform/forgot-password. Expects form: email.
+// POST /platform/password/forgot. Expects form: email.
 func (a *Auth) PlatformForgotPassword(w http.ResponseWriter, r *http.Request) {
 	if a.cfg.PlatformAdminStore == nil || !a.resetEnabled() {
 		http.Error(w, "not enabled", http.StatusNotFound)
@@ -214,7 +215,7 @@ func (a *Auth) PlatformForgotPassword(w http.ResponseWriter, r *http.Request) {
 // PlatformResetPassword completes a platform admin's recovery: consume the
 // token, set the new password, revoke platform sessions. 2FA enrollment is
 // untouched — the admin still passes TOTP at next login. Mount on:
-// POST /platform/reset-password. Expects form: token, password.
+// POST /platform/password/reset. Expects form: token, password.
 func (a *Auth) PlatformResetPassword(w http.ResponseWriter, r *http.Request) {
 	if a.cfg.PlatformAdminStore == nil || a.cfg.PasswordResetStore == nil {
 		http.Error(w, "not enabled", http.StatusNotFound)

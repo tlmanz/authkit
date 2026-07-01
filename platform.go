@@ -115,17 +115,23 @@ func withPlatformAdmin(ctx context.Context, p *PlatformAdmin) context.Context {
 }
 
 // PlatformAdminRecord is what PlatformAdminStore returns for login. TOTPSecret
-// is the decrypted TOTP secret (the store handles encryption at rest); 2FA is
-// mandatory for platform admins, so it is always present after bootstrap.
+// is the decrypted TOTP secret (the store handles encryption at rest), and is
+// empty for an admin who has not enrolled yet; TOTPConfirmed reports whether that
+// secret has been activated by a first successful verification. 2FA is mandatory,
+// but a console-created admin enrolls on first login (pending→confirmed), so the
+// secret is not always present immediately (only after bootstrap, or post-enroll).
 type PlatformAdminRecord struct {
 	Email          string
 	Name           string
 	HashedPassword string
 	Role           string
 	TOTPSecret     string
+	TOTPConfirmed  bool
 }
 
-// PlatformAdminStore looks up platform admins (separate from UserStore).
+// PlatformAdminStore looks up platform admins (separate from UserStore) and backs
+// their TOTP enrollment. Admin lifecycle (create/list/remove) lives in the host
+// app's own store methods; this interface is only what authkit's auth flow needs.
 type PlatformAdminStore interface {
 	GetPlatformAdmin(ctx context.Context, email string) (*PlatformAdminRecord, error)
 
@@ -134,6 +140,16 @@ type PlatformAdminStore interface {
 	// the TOTP secret (2FA stays mandatory). Runs on the pool — platform_admins
 	// has no RLS.
 	UpdatePassword(ctx context.Context, email, hashedPassword string) error
+
+	// EnrollPlatformTOTP stores (or replaces) a PENDING secret + recovery hashes
+	// for an admin who has not confirmed 2FA yet (mirrors the tenant TOTPStore).
+	EnrollPlatformTOTP(ctx context.Context, email, secret string, recoveryCodeHashes []string) error
+	// ConfirmPlatformTOTP activates a pending secret on first successful verify.
+	// Idempotent: a no-op once confirmed.
+	ConfirmPlatformTOTP(ctx context.Context, email string) error
+	// ConsumePlatformRecovery atomically marks a recovery code used (single-use)
+	// and reports whether it matched an unused code.
+	ConsumePlatformRecovery(ctx context.Context, email, codeHash string) (bool, error)
 }
 
 // PlatformPolicy maps a platform role to its capabilities (a small, static
@@ -174,17 +190,21 @@ func (a *Auth) PlatformLogin(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid credentials", http.StatusUnauthorized)
 		return
 	}
-	// Password must be correct AND the admin must have TOTP enrolled (always true
-	// after bootstrap) before we reveal the second step.
-	if !CheckPassword(rec.HashedPassword, password) || rec.TOTPSecret == "" {
+	if !CheckPassword(rec.HashedPassword, password) {
 		a.platformLoginFail(r, tkey, email)
 		http.Error(w, "invalid credentials", http.StatusUnauthorized)
 		return
 	}
 
-	// Password correct → arm the TOTP step. Throttle is reset only on full success.
+	// Password correct → arm the TOTP step. A console-created admin who has not yet
+	// confirmed 2FA enrolls now (pending→confirm); everyone else verifies. Throttle
+	// is reset only on full success.
 	a.setPlatformPendingCookie(w, a.issuePlatformPendingToken(email))
-	writeJSON(w, http.StatusOK, map[string]string{"status": "2fa_required"})
+	action := "verify"
+	if !rec.TOTPConfirmed {
+		action = "enroll"
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "2fa_required", "action": action})
 }
 
 func (a *Auth) platformLoginFail(r *http.Request, tkey, email string) {
@@ -215,10 +235,16 @@ func (a *Auth) PlatformVerify2FA(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid challenge", http.StatusUnauthorized)
 		return
 	}
-	code := strings.TrimSpace(r.FormValue("code"))
-	if rec.TOTPSecret == "" || !totp.Validate(code, rec.TOTPSecret) {
+	if !a.validatePlatform2FA(r.Context(), rec, r) {
 		a.platformLoginFail(r, tkey, email)
 		http.Error(w, "invalid code", http.StatusUnauthorized)
+		return
+	}
+	// First successful verification confirms a pending enrollment (idempotent once
+	// confirmed), so subsequent logins go straight to verify.
+	if err := a.cfg.PlatformAdminStore.ConfirmPlatformTOTP(r.Context(), email); err != nil {
+		a.log.Error("authkit: platform totp confirm failed: %v", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 	a.throttleReset(r.Context(), tkey)
@@ -231,6 +257,70 @@ func (a *Auth) PlatformVerify2FA(w http.ResponseWriter, r *http.Request) {
 	}
 	a.emitAudit(r.Context(), AuditEvent{Type: AuditLogin, Actor: email, IP: clientIP(r), At: nowFn(), Meta: map[string]any{"platform": true, "result": "ok"}})
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// validatePlatform2FA checks the submitted recovery code or TOTP code against the
+// admin's record. A pending (unconfirmed) secret still validates — the first valid
+// code is what confirms it (PlatformVerify2FA calls ConfirmPlatformTOTP on success).
+func (a *Auth) validatePlatform2FA(ctx context.Context, rec *PlatformAdminRecord, r *http.Request) bool {
+	if rc := strings.TrimSpace(r.FormValue("recovery_code")); rc != "" {
+		ok, err := a.cfg.PlatformAdminStore.ConsumePlatformRecovery(ctx, rec.Email, hashRecoveryCode(rc))
+		return err == nil && ok
+	}
+	code := strings.TrimSpace(r.FormValue("code"))
+	if code == "" || rec.TOTPSecret == "" {
+		return false
+	}
+	return totp.Validate(code, rec.TOTPSecret)
+}
+
+// PlatformEnroll2FA provisions a PENDING TOTP secret + recovery codes for a
+// platform admin who passed the password step but has not enrolled 2FA yet, and
+// returns the otpauth URL + recovery codes to show once. The admin confirms by
+// calling PlatformVerify2FA with a code. Mount on: POST /platform/2fa/enroll.
+//
+// It refuses once 2FA is confirmed: a stolen password alone must never be able to
+// re-enroll (and thus reset) a platform admin's authenticator. Re-enrollment of a
+// confirmed admin only happens after another admin resets their 2FA.
+func (a *Auth) PlatformEnroll2FA(w http.ResponseWriter, r *http.Request) {
+	if a.cfg.PlatformAdminStore == nil {
+		http.Error(w, "platform admin not enabled", http.StatusNotFound)
+		return
+	}
+	email, ok := a.readPlatformPending(r)
+	if !ok {
+		http.Error(w, "no pending platform challenge", http.StatusUnauthorized)
+		return
+	}
+	rec, err := a.cfg.PlatformAdminStore.GetPlatformAdmin(r.Context(), email)
+	if err != nil {
+		http.Error(w, "invalid challenge", http.StatusUnauthorized)
+		return
+	}
+	if rec.TOTPConfirmed {
+		http.Error(w, "2fa already enrolled", http.StatusConflict)
+		return
+	}
+	key, err := totp.Generate(totp.GenerateOpts{Issuer: a.appName() + " Platform", AccountName: email})
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	plain, hashes, err := generateRecoveryCodes(recoveryCodeCount)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	if err := a.cfg.PlatformAdminStore.EnrollPlatformTOTP(r.Context(), email, key.Secret(), hashes); err != nil {
+		a.log.Error("authkit: platform totp enroll failed: %v", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"otpauthUrl":    key.URL(),
+		"secret":        key.Secret(),
+		"recoveryCodes": plain,
+	})
 }
 
 // establishPlatformSession mints a platform session (separate cookie, no tenant).

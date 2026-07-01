@@ -189,6 +189,17 @@ type Config struct {
 	// URL). Defaults to "App".
 	AppName string
 
+	// ── Trusted devices ("remember this device", skip 2FA) ────────────────
+	// TrustedDeviceStore enables a "trust this device" option at the 2FA step: a
+	// remembered device skips the TOTP prompt (the password is still required) for
+	// TrustedDeviceTTL. The token is opaque + server-side, so it is revocable
+	// (logout-everywhere, password change/reset, and disabling 2FA all drop it).
+	// When nil, every 2FA login prompts for TOTP. NOT used for platform admins.
+	TrustedDeviceStore TrustedDeviceStore
+
+	// TrustedDeviceTTL bounds how long a trusted device skips 2FA. Defaults to 30d.
+	TrustedDeviceTTL time.Duration
+
 	// ── Mobile token layer (§7.6) ─────────────────────────────────────────
 	// EnableTokens turns on the OAuth2/PKCE token endpoints and the bearer-JWT
 	// verifier. Requires SigningKeys and RefreshTokenStore.

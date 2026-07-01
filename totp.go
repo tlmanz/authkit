@@ -23,13 +23,39 @@ import (
 // with the user's tenant already on the context (TOTP access is tenant-scoped).
 type TOTPStore interface {
 	// Enroll stores (or replaces) the user's TOTP secret and the hashed recovery
-	// codes, marking the user enrolled.
+	// codes as PENDING — provisioned but NOT yet confirmed. The user is not
+	// considered to have working 2FA until they prove possession of the
+	// authenticator with a valid code (see Confirm). This two-phase model is what
+	// lets a user who abandons enrollment (got the QR, never added it) be sent
+	// back to enroll on the next login instead of being locked at the verify step.
 	Enroll(ctx context.Context, tenantID, email, secret string, recoveryCodeHashes []string) error
-	// Secret returns the user's TOTP secret and whether they are enrolled.
-	Secret(ctx context.Context, tenantID, email string) (secret string, enrolled bool, err error)
+	// Confirm marks a pending secret confirmed (activated). Called once, on the
+	// user's first successful verification. MUST be idempotent: a no-op when the
+	// secret is already confirmed or absent.
+	Confirm(ctx context.Context, tenantID, email string) error
+	// Secret returns the user's TOTP secret (empty when none is stored) and whether
+	// it has been CONFIRMED. A non-empty secret with confirmed=false is a pending
+	// enrollment: it can be validated (to confirm it) but does not by itself mean
+	// the user has set up 2FA.
+	Secret(ctx context.Context, tenantID, email string) (secret string, confirmed bool, err error)
 	// ConsumeRecovery atomically marks a recovery code used (single-use) and
 	// reports whether it matched an unused code.
 	ConsumeRecovery(ctx context.Context, tenantID, email, codeHash string) (bool, error)
+}
+
+// TOTPManager is an OPTIONAL extension of TOTPStore for self-service 2FA
+// management (disable, regenerate recovery codes). authkit type-asserts the
+// configured TOTPStore to this — a store that does not implement it simply
+// makes those endpoints return 501, leaving the base enroll/verify flow intact.
+// Kept separate from TOTPStore so adding management never breaks existing
+// implementers (e.g. the platform-admin store, whose 2FA is mandatory).
+type TOTPManager interface {
+	// Disable removes the user's TOTP secret and all recovery codes (turning 2FA
+	// off). Idempotent: a no-op when none is stored.
+	Disable(ctx context.Context, tenantID, email string) error
+	// ReplaceRecoveryCodes deletes the user's existing recovery codes and stores
+	// the given hashed set, without touching the confirmed TOTP secret.
+	ReplaceRecoveryCodes(ctx context.Context, tenantID, email string, recoveryCodeHashes []string) error
 }
 
 const (
@@ -111,15 +137,17 @@ func (a *Auth) clearPendingCookie(w http.ResponseWriter) {
 // requires 2FA. It sets the pending cookie and tells the client whether to
 // enroll or verify. It does NOT mint a full session.
 func (a *Auth) beginTwoFactor(ctx context.Context, w http.ResponseWriter, email string) {
-	_, enrolled, err := a.cfg.TOTPStore.Secret(ctx, tenantFromCtxOrEmpty(ctx), email)
+	_, confirmed, err := a.cfg.TOTPStore.Secret(ctx, tenantFromCtxOrEmpty(ctx), email)
 	if err != nil {
 		a.log.Error("authkit: totp secret lookup failed: %v", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 	a.setPendingCookie(w, a.issuePendingToken(email))
+	// Enroll unless 2FA is fully confirmed: no secret yet, OR a pending one the
+	// user provisioned but never verified (so they aren't stranded at verify).
 	action := "verify"
-	if !enrolled {
+	if !confirmed {
 		action = "enroll"
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "2fa_required", "action": action})
@@ -157,6 +185,13 @@ func (a *Auth) Verify2FA(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid code", http.StatusUnauthorized)
 		return
 	}
+	// The first successful verification confirms a pending enrollment (idempotent
+	// for an already-confirmed secret), so future logins go straight to verify.
+	if err := a.cfg.TOTPStore.Confirm(ctx, storedUser.TenantID, email); err != nil {
+		a.log.Error("authkit: totp confirm failed: %v", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
 	a.throttleReset(ctx, tkey)
 	a.clearPendingCookie(w)
 
@@ -165,6 +200,9 @@ func (a *Auth) Verify2FA(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "session error", http.StatusInternalServerError)
 		return
 	}
+	// Honor "remember this device": mint a trusted-device token so future logins
+	// from this browser skip the TOTP step (revocable + expiring).
+	a.rememberDevice(ctx, w, r, storedUser.TenantID, email)
 	http.Redirect(w, r, a.cfg.AfterLoginURL, http.StatusSeeOther)
 }
 
@@ -178,8 +216,12 @@ func (a *Auth) validate2FA(ctx context.Context, tenantID, email string, r *http.
 	if code == "" {
 		return false
 	}
-	secret, enrolled, err := a.cfg.TOTPStore.Secret(ctx, tenantID, email)
-	if err != nil || !enrolled {
+	// Validate against the stored secret whether or not it is confirmed yet — the
+	// first valid code is exactly what confirms a pending enrollment (Verify2FA
+	// calls Confirm on success). A confirmed flag here would make confirmation
+	// impossible.
+	secret, _, err := a.cfg.TOTPStore.Secret(ctx, tenantID, email)
+	if err != nil || secret == "" {
 		return false
 	}
 	return totp.Validate(code, secret)

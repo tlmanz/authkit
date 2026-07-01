@@ -125,8 +125,20 @@ func (a *Auth) Login(w http.ResponseWriter, r *http.Request) {
 	role, permissions := a.rbacProvider.RoleFor(ctx, email)
 
 	// Two-step auth: when the role requires 2FA, stop here and start the TOTP
-	// challenge instead of minting a session.
+	// challenge instead of minting a session — UNLESS this device was previously
+	// trusted ("remember this device"), in which case skip straight to a session.
+	// The password was still required; the trusted token is revocable + expiring.
 	if a.cfg.TOTPStore != nil && a.requires2FA(role) {
+		if a.trustedDeviceValid(r, storedUser.TenantID, email) {
+			if err := a.establishLoginSession(ctx, w, r, email, storedUser); err != nil {
+				a.log.Error("authkit: session error during trusted-device login: %v", err)
+				http.Error(w, "session error", http.StatusInternalServerError)
+				return
+			}
+			a.emitAudit(ctx, AuditEvent{Type: AuditLogin, TenantID: storedUser.TenantID, Actor: email, Subject: email, IP: clientIP(r), At: nowFn(), Meta: map[string]any{"trusted_device": true}})
+			http.Redirect(w, r, a.cfg.AfterLoginURL, http.StatusSeeOther)
+			return
+		}
 		a.beginTwoFactor(ctx, w, email)
 		return
 	}

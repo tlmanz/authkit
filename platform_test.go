@@ -2,6 +2,7 @@ package authkit
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -15,7 +16,10 @@ import (
 
 const platformTOTPSecret = "JBSWY3DPEHPK3PXP"
 
-type memPlatformStore struct{ rec *PlatformAdminRecord }
+type memPlatformStore struct {
+	rec      *PlatformAdminRecord
+	recovery map[string]bool // hash -> used
+}
 
 func (m *memPlatformStore) GetPlatformAdmin(_ context.Context, email string) (*PlatformAdminRecord, error) {
 	if m.rec == nil || !strings.EqualFold(email, m.rec.Email) {
@@ -30,6 +34,39 @@ func (m *memPlatformStore) UpdatePassword(_ context.Context, email, hashed strin
 	}
 	m.rec.HashedPassword = hashed
 	return nil
+}
+
+func (m *memPlatformStore) EnrollPlatformTOTP(_ context.Context, email, secret string, hashes []string) error {
+	if m.rec == nil || !strings.EqualFold(email, m.rec.Email) {
+		return ErrUserNotFound
+	}
+	m.rec.TOTPSecret = secret
+	m.rec.TOTPConfirmed = false
+	m.recovery = map[string]bool{}
+	for _, h := range hashes {
+		m.recovery[h] = false
+	}
+	return nil
+}
+
+func (m *memPlatformStore) ConfirmPlatformTOTP(_ context.Context, email string) error {
+	if m.rec == nil || !strings.EqualFold(email, m.rec.Email) {
+		return ErrUserNotFound
+	}
+	m.rec.TOTPConfirmed = true
+	return nil
+}
+
+func (m *memPlatformStore) ConsumePlatformRecovery(_ context.Context, email, hash string) (bool, error) {
+	if m.rec == nil || !strings.EqualFold(email, m.rec.Email) {
+		return false, nil
+	}
+	used, exists := m.recovery[hash]
+	if !exists || used {
+		return false, nil
+	}
+	m.recovery[hash] = true
+	return true, nil
 }
 
 type staticPlatformPolicy struct{}
@@ -77,7 +114,8 @@ func platformAuth(t *testing.T, role string, audit AuditSink) *Auth {
 		SessionStore:  newMemStore(),
 		AuditSink:     audit,
 		PlatformAdminStore: &memPlatformStore{rec: &PlatformAdminRecord{
-			Email: "root@klutch.lk", Name: "Root", HashedPassword: pw, Role: role, TOTPSecret: platformTOTPSecret,
+			Email: "root@klutch.lk", Name: "Root", HashedPassword: pw, Role: role,
+			TOTPSecret: platformTOTPSecret, TOTPConfirmed: true,
 		}},
 		PlatformPolicy:      staticPlatformPolicy{},
 		EnableImpersonation: true,
@@ -182,6 +220,96 @@ func TestPlatformLogin_TwoStepPasswordThenTOTP(t *testing.T) {
 	platformLogin(t, a)
 	if audit.count(AuditLogin) < 1 {
 		t.Fatal("expected an audit login event")
+	}
+}
+
+// TestPlatformLogin_EnrollThenConfirm covers a console-created admin with no TOTP
+// yet: login offers enroll, stays enroll until a code confirms it, then verifies.
+// Mirrors the tenant pending→confirm regression so platform admins can't get stuck.
+func TestPlatformLogin_EnrollThenConfirm(t *testing.T) {
+	pw, _ := HashPassword("super-secret-pw")
+	store := &memPlatformStore{rec: &PlatformAdminRecord{
+		Email: "new@klutch.lk", Name: "New", HashedPassword: pw, Role: "support",
+		// No TOTPSecret, not confirmed — a freshly created admin.
+	}}
+	a, err := New(Config{
+		Mode: AuthModePassword, SessionSecret: "0123456789abcdef0123456789abcdef",
+		UserStore: stubUserStore{}, SessionStore: newMemStore(),
+		PlatformAdminStore: store, PlatformPolicy: staticPlatformPolicy{},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	action := func() (string, *http.Cookie) {
+		rec := httptest.NewRecorder()
+		form := url.Values{"email": {"new@klutch.lk"}, "password": {"super-secret-pw"}}
+		req := httptest.NewRequest("POST", "/platform/login", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.RemoteAddr = "10.0.0.9:5555"
+		a.PlatformLogin(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("platform login = %d, want 200; body=%s", rec.Code, rec.Body.String())
+		}
+		var resp map[string]string
+		_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+		return resp["action"], findCookie(rec, a.platformPendingCookieName())
+	}
+
+	// First login → enroll.
+	act, pending := action()
+	if act != "enroll" {
+		t.Fatalf("first login action = %q, want enroll", act)
+	}
+
+	// Provision a pending secret.
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/platform/2fa/enroll", nil)
+	req.AddCookie(pending)
+	a.PlatformEnroll2FA(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("platform enroll = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var enroll struct {
+		Secret        string   `json:"secret"`
+		RecoveryCodes []string `json:"recoveryCodes"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &enroll)
+	if enroll.Secret == "" || len(enroll.RecoveryCodes) != recoveryCodeCount {
+		t.Fatalf("enroll resp missing secret/recovery: %+v", enroll)
+	}
+
+	// Re-login before confirming → still enroll.
+	if act, _ = action(); act != "enroll" {
+		t.Fatalf("re-login before confirm = %q, want enroll", act)
+	}
+
+	// Re-enroll attempt is fine while unconfirmed; now confirm with a real code.
+	act, pending = action()
+	code, _ := totp.GenerateCode(enroll.Secret, time.Now())
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest("POST", "/platform/2fa/verify", strings.NewReader(url.Values{"code": {code}}.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.RemoteAddr = "10.0.0.9:5555"
+	req.AddCookie(pending)
+	a.PlatformVerify2FA(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("platform verify = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if findCookie(rec, a.platformCookieName()) == nil {
+		t.Fatal("no platform session after confirm")
+	}
+
+	// Now login goes straight to verify, and re-enrollment is refused.
+	if act, pending = action(); act != "verify" {
+		t.Fatalf("login after confirm = %q, want verify", act)
+	}
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest("POST", "/platform/2fa/enroll", nil)
+	req.AddCookie(pending)
+	a.PlatformEnroll2FA(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("re-enroll after confirm = %d, want 409", rec.Code)
 	}
 }
 

@@ -13,28 +13,34 @@ import (
 	"github.com/pquerna/otp/totp"
 )
 
-// memTOTPStore is an in-memory TOTPStore.
+// memTOTPStore is an in-memory TOTPStore. A secret is pending until Confirm.
 type memTOTPStore struct {
-	secrets  map[string]string          // email -> secret
-	enrolled map[string]bool            // email -> enrolled
-	recovery map[string]map[string]bool // email -> hash -> used
+	secrets   map[string]string          // email -> secret
+	confirmed map[string]bool            // email -> confirmed (activated)
+	recovery  map[string]map[string]bool // email -> hash -> used
 }
 
 func newMemTOTP() *memTOTPStore {
-	return &memTOTPStore{secrets: map[string]string{}, enrolled: map[string]bool{}, recovery: map[string]map[string]bool{}}
+	return &memTOTPStore{secrets: map[string]string{}, confirmed: map[string]bool{}, recovery: map[string]map[string]bool{}}
 }
 
 func (m *memTOTPStore) Enroll(_ context.Context, _, email, secret string, hashes []string) error {
 	m.secrets[email] = secret
-	m.enrolled[email] = true
+	m.confirmed[email] = false // pending until first verify confirms it
 	m.recovery[email] = map[string]bool{}
 	for _, h := range hashes {
 		m.recovery[email][h] = false
 	}
 	return nil
 }
+func (m *memTOTPStore) Confirm(_ context.Context, _, email string) error {
+	if _, ok := m.secrets[email]; ok {
+		m.confirmed[email] = true
+	}
+	return nil
+}
 func (m *memTOTPStore) Secret(_ context.Context, _, email string) (string, bool, error) {
-	return m.secrets[email], m.enrolled[email], nil
+	return m.secrets[email], m.confirmed[email], nil
 }
 func (m *memTOTPStore) ConsumeRecovery(_ context.Context, _, email, hash string) (bool, error) {
 	codes, ok := m.recovery[email]
@@ -153,6 +159,63 @@ func TestLogin_RequiresEnrollThen2FA(t *testing.T) {
 	}
 	if findCookie(rec, a.sidCookieName()) == nil {
 		t.Fatal("no session minted after successful 2FA")
+	}
+}
+
+// TestLogin_PendingEnrollmentStaysEnroll pins the bug fix: starting enrollment
+// (provisioning a secret) but never verifying must NOT flip the next login to the
+// verify step — the user has no working authenticator and would be locked out.
+// Re-login must keep returning "enroll" until a code confirms the secret.
+func TestLogin_PendingEnrollmentStaysEnroll(t *testing.T) {
+	store := newMemTOTP()
+	a := twoFAAuth(t, store)
+
+	action := func() string {
+		rec := doLogin(t, a)
+		var resp map[string]string
+		_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+		return resp["action"]
+	}
+
+	// First login: not enrolled → enroll.
+	if got := action(); got != "enroll" {
+		t.Fatalf("first login action = %q, want enroll", got)
+	}
+
+	// Provision a secret (open the QR) but DO NOT verify it.
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/auth/2fa/enroll", nil)
+	req.AddCookie(findCookie(doLogin(t, a), a.twofaCookieName()))
+	a.Enroll2FA(rec, req)
+	var enroll struct {
+		Secret string `json:"secret"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &enroll)
+	if enroll.Secret == "" {
+		t.Fatal("enroll did not return a secret")
+	}
+
+	// Re-login after abandoning enrollment: must STILL be enroll (the bug returned
+	// verify here, locking the user out).
+	if got := action(); got != "enroll" {
+		t.Fatalf("re-login after unconfirmed enroll = %q, want enroll", got)
+	}
+
+	// Verify with a real code → confirms the secret.
+	code, _ := totp.GenerateCode(enroll.Secret, time.Now())
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest("POST", "/auth/2fa/verify", strings.NewReader(url.Values{"code": {code}}.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(findCookie(doLogin(t, a), a.twofaCookieName()))
+	req.RemoteAddr = "10.0.0.1:1111"
+	a.Verify2FA(rec, req)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("verify status = %d, want 303", rec.Code)
+	}
+
+	// Now that 2FA is confirmed, login goes to verify.
+	if got := action(); got != "verify" {
+		t.Fatalf("login after confirmation = %q, want verify", got)
 	}
 }
 
