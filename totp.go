@@ -96,7 +96,15 @@ func (a *Auth) readPendingToken(r *http.Request) (string, bool) {
 	if err != nil {
 		return "", false
 	}
-	payload, mac, ok := strings.Cut(c.Value, ".")
+	return a.parsePendingToken(c.Value)
+}
+
+// parsePendingToken validates a signed pending-2FA token value (the same token
+// minted by issuePendingToken) and returns the email it binds. Shared by the
+// cookie-based web flow (readPendingToken) and the mobile flow, which carries
+// the token in the request body instead of a cookie.
+func (a *Auth) parsePendingToken(value string) (string, bool) {
+	payload, mac, ok := strings.Cut(value, ".")
 	if !ok || subtle.ConstantTimeCompare([]byte(mac), []byte(a.sign(payload))) != 1 {
 		return "", false
 	}
