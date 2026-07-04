@@ -57,9 +57,17 @@ func (a *Auth) IssuePasswordToken(w http.ResponseWriter, r *http.Request) {
 	ctx := WithTenant(r.Context(), storedUser.TenantID)
 	role, _ := a.rbacProvider.RoleFor(ctx, email)
 
+	// A remembered device skips the TOTP step (password is still required).
+	// The mobile client presents the opaque trusted-device token in the body.
+	needs2FA := a.cfg.TOTPStore != nil && a.requires2FA(role)
+	if needs2FA && a.trustedDeviceTokenValid(
+		ctx, storedUser.TenantID, email, r.FormValue("trusted_device_token")) {
+		needs2FA = false
+	}
+
 	// Second factor required: mint a signed pending token and tell the client
 	// whether to enroll (no confirmed secret yet) or verify.
-	if a.cfg.TOTPStore != nil && a.requires2FA(role) {
+	if needs2FA {
 		_, confirmed, err := a.cfg.TOTPStore.Secret(ctx, storedUser.TenantID, email)
 		if err != nil {
 			a.log.Error("authkit: totp secret lookup failed: %v", err)
@@ -159,6 +167,24 @@ func (a *Auth) IssuePasswordToken2FA(w http.ResponseWriter, r *http.Request) {
 		writeTokenError(w, http.StatusInternalServerError, "server_error", "internal error")
 		return
 	}
-	a.emitAudit(ctx, AuditEvent{Type: AuditLogin, TenantID: u.TenantID, Actor: email, Subject: email, IP: clientIP(r), At: nowFn(), Meta: map[string]any{"client": "mobile", "twofa": true}})
-	writeTokenResponse(w, access, refresh, a.accessTTL())
+
+	// "Remember this device": mint an opaque trusted-device token the client
+	// stores and presents on the next login to skip the TOTP step.
+	var trusted string
+	if formTrue(r.FormValue("remember")) {
+		trusted = a.mintTrustedDeviceToken(ctx, storedUser.TenantID, email)
+	}
+
+	a.emitAudit(ctx, AuditEvent{Type: AuditLogin, TenantID: u.TenantID, Actor: email, Subject: email, IP: clientIP(r), At: nowFn(), Meta: map[string]any{"client": "mobile", "twofa": true, "remembered": trusted != ""}})
+
+	resp := map[string]any{
+		"access_token":  access,
+		"refresh_token": refresh,
+		"token_type":    "Bearer",
+		"expires_in":    int(a.accessTTL().Seconds()),
+	}
+	if trusted != "" {
+		resp["trusted_device_token"] = trusted
+	}
+	writeJSON(w, http.StatusOK, resp)
 }

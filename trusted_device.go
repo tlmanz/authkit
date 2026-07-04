@@ -59,6 +59,42 @@ func (a *Auth) trustedDeviceValid(r *http.Request, tenantID, email string) bool 
 	return err == nil && ok
 }
 
+// trustedDeviceTokenValid is the cookie-free variant used by the mobile token
+// flow: the client presents the opaque trusted-device token in the request body
+// instead of a cookie. Reports whether it is a live trust for (tenantID, email).
+func (a *Auth) trustedDeviceTokenValid(ctx context.Context, tenantID, email, token string) bool {
+	if a.cfg.TrustedDeviceStore == nil || token == "" {
+		return false
+	}
+	ok, err := a.cfg.TrustedDeviceStore.IsTrusted(WithTenant(ctx, tenantID), tenantID, email, token)
+	return err == nil && ok
+}
+
+// mintTrustedDeviceToken records a trusted device and returns the opaque token
+// for the mobile client to store (secure storage) and present on next login.
+// Best-effort: an error yields an empty token and never blocks the login.
+func (a *Auth) mintTrustedDeviceToken(ctx context.Context, tenantID, email string) string {
+	if a.cfg.TrustedDeviceStore == nil {
+		return ""
+	}
+	token, err := a.cfg.TrustedDeviceStore.Trust(ctx, tenantID, email, a.trustedDeviceTTL())
+	if err != nil {
+		a.log.Error("authkit: trust device (mobile): %v", err)
+		return ""
+	}
+	return token
+}
+
+// formTrue reports whether a form value is a truthy "remember" flag.
+func formTrue(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "true", "on", "1", "yes":
+		return true
+	default:
+		return false
+	}
+}
+
 // rememberDevice mints + sets a trusted-device cookie when the client asked to
 // (the "trust this device" checkbox: a truthy `remember` form value) and a store
 // is configured. Best-effort: a failure to remember never blocks the login.
