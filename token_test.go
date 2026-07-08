@@ -69,6 +69,17 @@ func (s *memRefreshStore) RevokeChain(_ context.Context, chainID string) error {
 	}
 	return nil
 }
+func (s *memRefreshStore) RevokeAllForUser(_ context.Context, tenantID, email string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	for _, t := range s.m {
+		if t.TenantID == tenantID && t.UserEmail == email && t.RevokedAt == nil {
+			t.RevokedAt = &now
+		}
+	}
+	return nil
+}
 
 // testSigningKeys derives a stable Ed25519 seed from each kid, so the same kid
 // yields the same key regardless of position (needed to test rotation).
@@ -227,6 +238,81 @@ func TestToken_VerifierResolvesPermsServerSide(t *testing.T) {
 	}
 	if seen == nil || !seen.Can("invoice:issue") {
 		t.Fatal("permissions not resolved server-side for token auth")
+	}
+}
+
+// memAuthCodeStore is an in-memory AuthCodeStore: a jti may be claimed once.
+type memAuthCodeStore struct {
+	mu   sync.Mutex
+	seen map[string]bool
+}
+
+func newMemAuthCodes() *memAuthCodeStore { return &memAuthCodeStore{seen: map[string]bool{}} }
+
+func (s *memAuthCodeStore) ClaimAuthCode(_ context.Context, jti string, _ time.Time) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.seen[jti] {
+		return false, nil
+	}
+	s.seen[jti] = true
+	return true, nil
+}
+
+// TestPKCE_CodeIsSingleUse pins the fix: with an AuthCodeStore configured, an
+// authorization code redeemed once cannot be exchanged a second time inside its
+// TTL, even with the correct verifier — a copied code is rejected.
+func TestPKCE_CodeIsSingleUse(t *testing.T) {
+	a, err := New(Config{
+		Mode: AuthModePassword, SessionSecret: "0123456789abcdef0123456789abcdef",
+		UserStore: twoFAUserStore{}, RBAC: RBACConfig{Provider: fixedRolePolicy{}},
+		SessionStore: newMemStore(), EnableTokens: true,
+		SigningKeys: testSigningKeys(t, "k1"), RefreshTokenStore: newMemRefresh(),
+		AccessTokenTTL: 15 * time.Minute, RefreshTokenTTL: 24 * time.Hour,
+		TokenIssuer: "https://api.klutch.lk", TokenClientID: "klutch-mobile",
+		TokenRedirectURIs: []string{"klutch://cb"},
+		AuthCodeStore:     newMemAuthCodes(),
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	verifier := "verifier-0123456789-0123456789-0123456789"
+	sum := sha256.Sum256([]byte(verifier))
+	challenge := base64.RawURLEncoding.EncodeToString(sum[:])
+
+	rec := httptest.NewRecorder()
+	estReq := httptest.NewRequest("POST", "/login", nil)
+	_ = a.establishServerSession(WithTenant(estReq.Context(), "t1"), rec, estReq, &User{Email: "owner@shop.lk", TenantID: "t1", Role: "owner"})
+	sessionCookie := rec.Result().Cookies()[0]
+
+	rec = httptest.NewRecorder()
+	au := url.Values{
+		"response_type": {"code"}, "client_id": {"klutch-mobile"},
+		"redirect_uri": {"klutch://cb"}, "code_challenge": {challenge},
+		"code_challenge_method": {"S256"},
+	}
+	req := httptest.NewRequest("GET", "/authorize?"+au.Encode(), nil)
+	req.AddCookie(sessionCookie)
+	a.Authorize(rec, req)
+	loc, _ := url.Parse(rec.Header().Get("Location"))
+	code := loc.Query().Get("code")
+
+	exchange := func() int {
+		rec := httptest.NewRecorder()
+		form := url.Values{
+			"grant_type": {"authorization_code"}, "code": {code},
+			"code_verifier": {verifier}, "redirect_uri": {"klutch://cb"},
+		}
+		req := httptest.NewRequest("POST", "/token", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		a.IssueToken(rec, req)
+		return rec.Code
+	}
+	if c := exchange(); c != http.StatusOK {
+		t.Fatalf("first exchange = %d, want 200", c)
+	}
+	if c := exchange(); c == http.StatusOK {
+		t.Fatal("second exchange of the same code succeeded (must be single-use)")
 	}
 }
 

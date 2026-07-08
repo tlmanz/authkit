@@ -271,7 +271,20 @@ func (a *Auth) validatePlatform2FA(ctx context.Context, rec *PlatformAdminRecord
 	if code == "" || rec.TOTPSecret == "" {
 		return false
 	}
-	return totp.Validate(code, rec.TOTPSecret)
+	ts, ok := matchTOTPTimestep(code, rec.TOTPSecret, nowFn())
+	if !ok {
+		return false
+	}
+	// Anti-replay (opt-in), same reasoning as the tenant path (validate2FA).
+	if g, has := a.cfg.PlatformAdminStore.(PlatformTOTPReplayGuard); has {
+		claimed, cerr := g.ClaimPlatformTOTPTimestep(ctx, rec.Email, ts)
+		if cerr != nil {
+			a.log.Error("authkit: platform totp replay claim: %v", cerr)
+		} else if !claimed {
+			return false
+		}
+	}
+	return true
 }
 
 // PlatformEnroll2FA provisions a PENDING TOTP secret + recovery codes for a

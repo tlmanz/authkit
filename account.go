@@ -69,6 +69,11 @@ func (a *Auth) ChangePassword(w http.ResponseWriter, r *http.Request) {
 		// A password change also forgets trusted devices: a 2FA role re-verifies
 		// on next login everywhere.
 		a.revokeTrustedDevices(ctx, u.TenantID, u.Email)
+		// ...and revokes every mobile refresh token, so the bearer axis is cut off
+		// too and does not keep minting access tokens for up to the refresh TTL.
+		if a.cfg.RefreshTokenStore != nil {
+			_ = a.cfg.RefreshTokenStore.RevokeAllForUser(ctx, u.TenantID, u.Email)
+		}
 		if err := a.establishServerSession(ctx, w, r, u); err != nil {
 			a.log.Error("authkit: re-establish session after password change: %v", err)
 			http.Error(w, "session error", http.StatusInternalServerError)
@@ -98,6 +103,11 @@ func (a *Auth) LogoutEverywhere(w http.ResponseWriter, r *http.Request) {
 	// "Log out everywhere" also forgets every trusted device, so a 2FA role is
 	// challenged again on each device next login.
 	a.revokeTrustedDevices(ctx, u.TenantID, u.Email)
+	// ...and revokes every mobile refresh token, so "log out all devices" truly
+	// includes the bearer axis (a fired-staff revoke cuts off the phone too).
+	if a.cfg.RefreshTokenStore != nil {
+		_ = a.cfg.RefreshTokenStore.RevokeAllForUser(ctx, u.TenantID, u.Email)
+	}
 	a.clearSIDCookie(w)
 	a.clearTrustedDeviceCookie(w)
 	a.emitAudit(ctx, AuditEvent{Type: AuditRevoke, TenantID: u.TenantID, Actor: u.Email, Subject: u.Email, IP: clientIP(r), At: nowFn(), Meta: map[string]any{"scope": "all"}})

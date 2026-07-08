@@ -218,6 +218,12 @@ type Config struct {
 	// detection).
 	RefreshTokenStore RefreshTokenStore
 
+	// AuthCodeStore, when set, makes PKCE authorization codes single-use: the
+	// code's jti is claimed at redemption so a code cannot be exchanged twice
+	// within its short TTL. Optional (nil keeps the stateless, replayable-within-
+	// TTL behavior); a short-TTL store (e.g. Redis) is the natural backing.
+	AuthCodeStore AuthCodeStore
+
 	// TokenIssuer is the JWT `iss` claim; TokenClientID the public mobile
 	// client id (also the JWT audience); TokenRedirectURIs the allowed PKCE
 	// redirect URIs.

@@ -18,6 +18,7 @@ type memTOTPStore struct {
 	secrets   map[string]string          // email -> secret
 	confirmed map[string]bool            // email -> confirmed (activated)
 	recovery  map[string]map[string]bool // email -> hash -> used
+	lastStep  map[string]int64           // email -> last-consumed TOTP time-step
 }
 
 func newMemTOTP() *memTOTPStore {
@@ -52,6 +53,19 @@ func (m *memTOTPStore) ConsumeRecovery(_ context.Context, _, email, hash string)
 		return false, nil
 	}
 	codes[hash] = true
+	return true, nil
+}
+
+// ClaimTOTPTimestep makes memTOTPStore a TOTPReplayGuard: a time-step is usable
+// once (a later step supersedes an earlier one).
+func (m *memTOTPStore) ClaimTOTPTimestep(_ context.Context, _, email string, timestep int64) (bool, error) {
+	if m.lastStep == nil {
+		m.lastStep = map[string]int64{}
+	}
+	if timestep <= m.lastStep[email] {
+		return false, nil
+	}
+	m.lastStep[email] = timestep
 	return true, nil
 }
 
@@ -216,6 +230,83 @@ func TestLogin_PendingEnrollmentStaysEnroll(t *testing.T) {
 	// Now that 2FA is confirmed, login goes to verify.
 	if got := action(); got != "verify" {
 		t.Fatalf("login after confirmation = %q, want verify", got)
+	}
+}
+
+// TestEnroll2FA_CannotReenrollConfirmed pins the security fix: once a user's TOTP
+// is confirmed, a request holding only a 2FA-pending token (i.e. a password-only
+// attacker) must NOT be able to re-enroll a fresh secret and thereby bypass 2FA
+// for a money role. The re-enroll must be refused (409) and the stored secret
+// must be left untouched.
+func TestEnroll2FA_CannotReenrollConfirmed(t *testing.T) {
+	store := newMemTOTP()
+	a := twoFAAuth(t, store)
+
+	// Enroll + confirm a real authenticator.
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/auth/2fa/enroll", nil)
+	req.AddCookie(findCookie(doLogin(t, a), a.twofaCookieName()))
+	a.Enroll2FA(rec, req)
+	var enroll struct {
+		Secret string `json:"secret"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &enroll)
+	code, _ := totp.GenerateCode(enroll.Secret, time.Now())
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest("POST", "/auth/2fa/verify", strings.NewReader(url.Values{"code": {code}}.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.AddCookie(findCookie(doLogin(t, a), a.twofaCookieName()))
+	req.RemoteAddr = "10.0.0.1:1111"
+	a.Verify2FA(rec, req)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("initial verify status = %d, want 303", rec.Code)
+	}
+	confirmedSecret := store.secrets["owner@shop.lk"]
+
+	// Attacker with only the password: fresh login yields a pending cookie; try to
+	// re-enroll to replace the confirmed authenticator.
+	pending := findCookie(doLogin(t, a), a.twofaCookieName())
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest("POST", "/auth/2fa/enroll", nil)
+	req.AddCookie(pending)
+	a.Enroll2FA(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("re-enroll of confirmed 2FA status = %d, want 409", rec.Code)
+	}
+	if store.secrets["owner@shop.lk"] != confirmedSecret {
+		t.Fatal("re-enroll overwrote the confirmed secret (2FA bypass)")
+	}
+	if !store.confirmed["owner@shop.lk"] {
+		t.Fatal("re-enroll cleared the confirmed flag (2FA bypass)")
+	}
+}
+
+// TestVerify2FA_CodeCannotBeReplayed pins the anti-replay fix: once a TOTP code
+// (its time-step) has completed a login, submitting the SAME code again within
+// its validity window is rejected, so an intercepted code can't be reused.
+func TestVerify2FA_CodeCannotBeReplayed(t *testing.T) {
+	store := newMemTOTP() // implements TOTPReplayGuard
+	a := twoFAAuth(t, store)
+	// Pre-enroll + confirm so login goes straight to verify.
+	secret := "JBSWY3DPEHPK3PXP"
+	_ = store.Enroll(context.Background(), "t1", "owner@shop.lk", secret, nil)
+	store.confirmed["owner@shop.lk"] = true
+
+	code, _ := totp.GenerateCode(secret, time.Now())
+	verify := func() int {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/auth/2fa/verify", strings.NewReader(url.Values{"code": {code}}.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.AddCookie(findCookie(doLogin(t, a), a.twofaCookieName()))
+		req.RemoteAddr = "10.0.0.1:1111"
+		a.Verify2FA(rec, req)
+		return rec.Code
+	}
+	if got := verify(); got != http.StatusSeeOther {
+		t.Fatalf("first verify = %d, want 303", got)
+	}
+	if got := verify(); got != http.StatusUnauthorized {
+		t.Fatalf("replayed code = %d, want 401 (replay must be rejected)", got)
 	}
 }
 

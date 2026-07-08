@@ -1,6 +1,7 @@
 package authkit
 
 import (
+	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
@@ -20,15 +21,26 @@ import (
 
 const authCodeTTL = 60 * time.Second
 
+// AuthCodeStore, when configured, makes PKCE authorization codes single-use.
+// ClaimAuthCode atomically records jti as redeemed and returns ok=false if it was
+// already redeemed (a replay). expiresAt lets the store self-expire the record
+// (the code is only valid for authCodeTTL). A short-TTL store (Redis) fits best.
+type AuthCodeStore interface {
+	ClaimAuthCode(ctx context.Context, jti string, expiresAt time.Time) (ok bool, err error)
+}
+
 type authCodeClaims struct {
 	Email     string `json:"e"`
 	Challenge string `json:"c"`
 	Redirect  string `json:"r"`
 	Exp       int64  `json:"x"`
+	JTI       string `json:"j"`
 }
 
 func (a *Auth) issueAuthCode(email, challenge, redirect string) string {
-	c := authCodeClaims{Email: email, Challenge: challenge, Redirect: redirect, Exp: nowFn().Add(authCodeTTL).Unix()}
+	// jti gives each code a unique id so AuthCodeStore can enforce single-use.
+	jti, _ := newOpaqueToken()
+	c := authCodeClaims{Email: email, Challenge: challenge, Redirect: redirect, Exp: nowFn().Add(authCodeTTL).Unix(), JTI: jti}
 	j, _ := json.Marshal(c)
 	payload := base64.RawURLEncoding.EncodeToString(j)
 	return payload + "." + a.sign(payload)
@@ -135,6 +147,22 @@ func (a *Auth) IssueToken(w http.ResponseWriter, r *http.Request) {
 	if !verifyPKCE(r.FormValue("code_verifier"), claims.Challenge) {
 		writeTokenError(w, http.StatusBadRequest, "invalid_grant", "PKCE verification failed")
 		return
+	}
+	// Single-use (opt-in): claim the code's jti so it cannot be redeemed twice
+	// within its TTL. A failed claim (already redeemed) is treated as an invalid
+	// grant. Fail closed on a store error: a redemption we can't prove is unique
+	// is refused rather than risk issuing two token chains from one code.
+	if a.cfg.AuthCodeStore != nil {
+		fresh, cerr := a.cfg.AuthCodeStore.ClaimAuthCode(r.Context(), claims.JTI, time.Unix(claims.Exp, 0))
+		if cerr != nil {
+			a.log.Error("authkit: auth code claim: %v", cerr)
+			writeTokenError(w, http.StatusBadRequest, "invalid_grant", "code could not be validated")
+			return
+		}
+		if !fresh {
+			writeTokenError(w, http.StatusBadRequest, "invalid_grant", "authorization code already used")
+			return
+		}
 	}
 
 	storedUser, err := a.cfg.UserStore.GetUserByEmail(r.Context(), claims.Email)

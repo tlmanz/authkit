@@ -131,6 +131,16 @@ func (a *Auth) ForgotPassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	email := strings.ToLower(strings.TrimSpace(r.FormValue("email")))
+	// Rate-limit before doing any email-existence-dependent work: this blunts
+	// reset email-bombing of a victim and the timing side channel that would
+	// otherwise distinguish a registered email (which does a store write +
+	// delivery) from an unknown one. Namespaced so it never shares the login
+	// lockout counter. The 429 reveals nothing about whether the email exists.
+	tkey := "pwreset|" + throttleKey(email, clientIP(r))
+	if !a.throttleAllow(w, r, tkey) {
+		return
+	}
+	a.throttleFailure(r.Context(), tkey)
 	if validEmail.MatchString(email) {
 		if u, err := a.cfg.UserStore.GetUserByEmail(r.Context(), email); err == nil {
 			ctx := WithTenant(r.Context(), u.TenantID)
@@ -183,11 +193,16 @@ func (a *Auth) ResetPassword(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	// A credential change invalidates every existing session + trusted device.
+	// A credential change invalidates every existing session + trusted device +
+	// mobile refresh token, so a password reset cuts off the bearer axis too and
+	// an attacker who triggered the reset cannot keep a live refresh chain.
 	if a.cfg.SessionStore != nil {
 		_ = a.cfg.SessionStore.RevokeAllForUser(ctx, u.TenantID, email)
 	}
 	a.revokeTrustedDevices(ctx, u.TenantID, email)
+	if a.cfg.RefreshTokenStore != nil {
+		_ = a.cfg.RefreshTokenStore.RevokeAllForUser(ctx, u.TenantID, email)
+	}
 	a.emitAudit(ctx, AuditEvent{Type: AuditPasswordReset, TenantID: u.TenantID, Actor: email, Subject: email, IP: clientIP(r), At: nowFn()})
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
@@ -201,6 +216,12 @@ func (a *Auth) PlatformForgotPassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	email := strings.ToLower(strings.TrimSpace(r.FormValue("email")))
+	// Same rate-limit + no-enumeration reasoning as ForgotPassword.
+	tkey := "pwreset|platform|" + throttleKey(email, clientIP(r))
+	if !a.throttleAllow(w, r, tkey) {
+		return
+	}
+	a.throttleFailure(r.Context(), tkey)
 	if validEmail.MatchString(email) {
 		if rec, err := a.cfg.PlatformAdminStore.GetPlatformAdmin(r.Context(), email); err == nil {
 			if _, derr := a.IssueResetToken(r.Context(), email, rec.Name, ResetKindPlatform); derr != nil {

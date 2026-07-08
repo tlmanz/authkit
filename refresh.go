@@ -39,6 +39,10 @@ type RefreshTokenStore interface {
 	Rotate(ctx context.Context, rawOld string, next *RefreshToken) error
 	// RevokeChain revokes every token sharing chainID (reuse response).
 	RevokeChain(ctx context.Context, chainID string) error
+	// RevokeAllForUser revokes every refresh token belonging to one user, so a
+	// credential change or "log out everywhere" cuts off the mobile axis too, not
+	// just cookie sessions. tenantID scopes the revoke; email identifies the user.
+	RevokeAllForUser(ctx context.Context, tenantID, email string) error
 }
 
 func (a *Auth) refreshTTL() time.Duration {

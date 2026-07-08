@@ -211,6 +211,9 @@ func (a *Auth) Verify2FA(w http.ResponseWriter, r *http.Request) {
 	// Honor "remember this device": mint a trusted-device token so future logins
 	// from this browser skip the TOTP step (revocable + expiring).
 	a.rememberDevice(ctx, w, r, storedUser.TenantID, email)
+	// Audit the completed web login for a 2FA (owner/manager, money) role: this is
+	// the highest-value login and the mobile 2FA path already audits it (§6.5#9).
+	a.emitAudit(ctx, AuditEvent{Type: AuditLogin, TenantID: storedUser.TenantID, Actor: email, Subject: email, IP: clientIP(r), At: nowFn(), Meta: map[string]any{"twofa": true}})
 	http.Redirect(w, r, a.cfg.AfterLoginURL, http.StatusSeeOther)
 }
 
@@ -232,7 +235,23 @@ func (a *Auth) validate2FA(ctx context.Context, tenantID, email string, r *http.
 	if err != nil || secret == "" {
 		return false
 	}
-	return totp.Validate(code, secret)
+	ts, ok := matchTOTPTimestep(code, secret, nowFn())
+	if !ok {
+		return false
+	}
+	// Anti-replay (opt-in): a given time-step is usable at most once, so an
+	// intercepted-and-replayed code is rejected. Fail open on a store error so a
+	// transient outage doesn't lock a legitimate login out (the throttler + the
+	// short window keep the residual risk low).
+	if g, has := a.cfg.TOTPStore.(TOTPReplayGuard); has {
+		claimed, cerr := g.ClaimTOTPTimestep(ctx, tenantID, email, ts)
+		if cerr != nil {
+			a.log.Error("authkit: totp replay claim: %v", cerr)
+		} else if !claimed {
+			return false
+		}
+	}
+	return true
 }
 
 // Enroll2FA provisions a new TOTP secret + recovery codes for the user
@@ -264,6 +283,16 @@ func (a *Auth) Enroll2FA(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := WithTenant(r.Context(), storedUser.TenantID)
+
+	// Refuse to overwrite an already-confirmed authenticator: a stolen password
+	// alone (holding only a 2FA-pending token) must never be able to re-enroll a
+	// new secret and thereby bypass 2FA. Resetting an active authenticator goes
+	// through DisableTwoFactor first, which requires an authenticated session.
+	// Mirrors PlatformEnroll2FA.
+	if _, confirmed, err := a.cfg.TOTPStore.Secret(ctx, storedUser.TenantID, email); err == nil && confirmed {
+		http.Error(w, "2fa already enrolled", http.StatusConflict)
+		return
+	}
 
 	key, err := totp.Generate(totp.GenerateOpts{Issuer: a.appName(), AccountName: email})
 	if err != nil {
