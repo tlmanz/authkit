@@ -144,7 +144,7 @@ func (a *Auth) IssueToken(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx := WithTenant(r.Context(), storedUser.TenantID)
 	role, _ := a.rbacProvider.RoleFor(ctx, claims.Email)
-	u := &User{Email: claims.Email, TenantID: storedUser.TenantID, BranchID: storedUser.BranchID, Role: role}
+	u := &User{Email: claims.Email, Name: storedUser.Name, TenantID: storedUser.TenantID, BranchID: storedUser.BranchID, Role: role}
 
 	access, refresh, err := a.issueTokenPair(ctx, u)
 	if err != nil {

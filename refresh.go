@@ -133,7 +133,7 @@ func (a *Auth) RefreshAccessToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	role, _ := a.rbacProvider.RoleFor(ctx, rt.UserEmail)
-	u := &User{Email: rt.UserEmail, TenantID: storedUser.TenantID, BranchID: storedUser.BranchID, Role: role}
+	u := &User{Email: rt.UserEmail, Name: storedUser.Name, TenantID: storedUser.TenantID, BranchID: storedUser.BranchID, Role: role}
 
 	next, err := newOpaqueToken()
 	if err != nil {

@@ -55,6 +55,7 @@ func newKeyring(keys []SigningKey) (*keyring, error) {
 // the token — they are resolved server-side per request (so changes take effect
 // within one access-token TTL).
 type accessClaims struct {
+	Name     string `json:"name,omitempty"`
 	TenantID string `json:"tenant_id"`
 	BranchID string `json:"branch_id,omitempty"`
 	Role     string `json:"role"`
@@ -72,6 +73,7 @@ func (a *Auth) accessTTL() time.Duration {
 func (a *Auth) issueAccessToken(u *User) (string, error) {
 	now := nowFn()
 	claims := accessClaims{
+		Name:     u.Name,
 		TenantID: u.TenantID,
 		BranchID: u.BranchID,
 		Role:     u.Role,
@@ -111,6 +113,7 @@ func (a *Auth) verifyAccessToken(raw string) (*User, error) {
 	}
 	return &User{
 		Email:    claims.Subject,
+		Name:     claims.Name,
 		Role:     claims.Role,
 		TenantID: claims.TenantID,
 		BranchID: claims.BranchID,
