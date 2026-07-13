@@ -88,17 +88,17 @@ func TestIssueAccessTokenOnly_NoRefreshTokenAndCustomTTL(t *testing.T) {
 	}
 }
 
-func TestIssueAccessTokenOnly_ZeroTTLFallsBackToConfigured(t *testing.T) {
+func TestIssueAccessTokenOnly_NonPositiveTTLIsRejected(t *testing.T) {
 	a := tokenAuth(t, testSigningKeys(t, "k1"), newMemRefresh())
 	u := &User{Email: "owner@shop.lk", TenantID: "t1", Role: "owner"}
-	rec := httptest.NewRecorder()
-	if err := a.IssueAccessTokenOnly(rec, u, 0); err != nil {
-		t.Fatalf("IssueAccessTokenOnly: %v", err)
-	}
-	var body map[string]any
-	_ = json.Unmarshal(rec.Body.Bytes(), &body)
-	if got := int(body["expires_in"].(float64)); got != int(a.accessTTL().Seconds()) {
-		t.Fatalf("expires_in = %d, want configured AccessTokenTTL %d", got, int(a.accessTTL().Seconds()))
+	for _, ttl := range []time.Duration{0, -time.Second} {
+		rec := httptest.NewRecorder()
+		if err := a.IssueAccessTokenOnly(rec, u, ttl); err == nil {
+			t.Fatalf("ttl=%v: expected an error, got none", ttl)
+		}
+		if rec.Code != 500 {
+			t.Fatalf("ttl=%v: status = %d, want 500", ttl, rec.Code)
+		}
 	}
 }
 
