@@ -54,8 +54,15 @@ func newKeyring(keys []SigningKey) (*keyring, error) {
 // accessClaims are the JWT claims for an access token. Permissions are NOT in
 // the token — they are resolved server-side per request (so changes take effect
 // within one access-token TTL).
+//
+// Provider mirrors User.Provider (e.g. "password", "demo") so principal-type
+// checks that key off it (like a "demo tenant" guard) see the same value for a
+// bearer-token request as they would for a cookie session — see
+// verifyAccessToken. Omitted from older tokens minted before this field
+// existed; those simply verify with Provider == "", identical to today.
 type accessClaims struct {
 	Name     string `json:"name,omitempty"`
+	Provider string `json:"provider,omitempty"`
 	TenantID string `json:"tenant_id"`
 	BranchID string `json:"branch_id,omitempty"`
 	Role     string `json:"role"`
@@ -69,11 +76,21 @@ func (a *Auth) accessTTL() time.Duration {
 	return 15 * time.Minute
 }
 
-// issueAccessToken signs a short-lived JWT for u with the current key.
+// issueAccessToken signs a short-lived JWT for u with the current key, using
+// the configured AccessTokenTTL.
 func (a *Auth) issueAccessToken(u *User) (string, error) {
+	return a.issueAccessTokenWithTTL(u, a.accessTTL())
+}
+
+// issueAccessTokenWithTTL signs a JWT for u with an explicit lifetime instead
+// of the configured AccessTokenTTL — see IssueAccessTokenOnly, whose callers
+// need a token bound to something shorter-lived than the principal itself
+// (e.g. an ephemeral tenant's own remaining lifetime).
+func (a *Auth) issueAccessTokenWithTTL(u *User, ttl time.Duration) (string, error) {
 	now := nowFn()
 	claims := accessClaims{
 		Name:     u.Name,
+		Provider: u.Provider,
 		TenantID: u.TenantID,
 		BranchID: u.BranchID,
 		Role:     u.Role,
@@ -82,7 +99,7 @@ func (a *Auth) issueAccessToken(u *User) (string, error) {
 			Subject:   u.Email,
 			Audience:  jwt.ClaimStrings{a.cfg.TokenClientID},
 			IssuedAt:  jwt.NewNumericDate(now),
-			ExpiresAt: jwt.NewNumericDate(now.Add(a.accessTTL())),
+			ExpiresAt: jwt.NewNumericDate(now.Add(ttl)),
 		},
 	}
 	tok := jwt.NewWithClaims(jwt.SigningMethodEdDSA, claims)
@@ -114,6 +131,7 @@ func (a *Auth) verifyAccessToken(raw string) (*User, error) {
 	return &User{
 		Email:    claims.Subject,
 		Name:     claims.Name,
+		Provider: claims.Provider,
 		Role:     claims.Role,
 		TenantID: claims.TenantID,
 		BranchID: claims.BranchID,
