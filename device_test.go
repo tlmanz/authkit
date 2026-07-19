@@ -7,6 +7,17 @@ import (
 	"testing"
 )
 
+// Test capability names — arbitrary host-declared strings in v2.
+const (
+	capJobReceive   = "print:job.receive"
+	capStatusReport = "print:status.report"
+)
+
+var testDeviceCaps = map[string]struct{}{
+	capJobReceive:   {},
+	capStatusReport: {},
+}
+
 // mockDeviceValidator is a test double for DeviceTokenValidator.
 type mockDeviceValidator struct {
 	rec *DeviceRecord
@@ -18,7 +29,7 @@ func (m *mockDeviceValidator) ValidateDeviceToken(_ context.Context, _ string) (
 }
 
 func deviceAuth(rec *DeviceRecord) *Auth {
-	return &Auth{deviceValidator: &mockDeviceValidator{rec: rec}}
+	return &Auth{deviceValidator: &mockDeviceValidator{rec: rec}, deviceCaps: testDeviceCaps}
 }
 
 func deviceRequest(token string) *http.Request {
@@ -29,9 +40,9 @@ func deviceRequest(token string) *http.Request {
 	return r
 }
 
-func TestDevice_Can_OnlyPrintCaps(t *testing.T) {
-	d := &Device{AgentID: "a1", TenantID: "t1", BranchID: "b1"}
-	for _, ok := range []string{CapPrintJobReceive, CapPrintStatusReport} {
+func TestDevice_Can_OnlyConfiguredCaps(t *testing.T) {
+	d := &Device{AgentID: "a1", TenantID: "t1", Attrs: map[string]string{"branch_id": "b1"}, caps: testDeviceCaps}
+	for _, ok := range []string{capJobReceive, capStatusReport} {
 		if !d.Can(ok) {
 			t.Errorf("device should hold %q", ok)
 		}
@@ -42,13 +53,13 @@ func TestDevice_Can_OnlyPrintCaps(t *testing.T) {
 		}
 	}
 	var nilDev *Device
-	if nilDev.Can(CapPrintJobReceive) {
+	if nilDev.Can(capJobReceive) {
 		t.Error("nil device must hold nothing")
 	}
 }
 
 func TestRequireDevice_ValidToken_BindsTenantAndDevice(t *testing.T) {
-	rec := &DeviceRecord{AgentID: "agent-1", Name: "Front Desk", TenantID: "tnt-1", BranchID: "brn-1"}
+	rec := &DeviceRecord{AgentID: "agent-1", Name: "Front Desk", TenantID: "tnt-1", Attrs: map[string]string{"branch_id": "brn-1"}}
 	a := deviceAuth(rec)
 
 	var gotDevice *Device
@@ -60,12 +71,12 @@ func TestRequireDevice_ValidToken_BindsTenantAndDevice(t *testing.T) {
 	})
 
 	w := httptest.NewRecorder()
-	a.RequireDevice(CapPrintStatusReport)(h).ServeHTTP(w, deviceRequest("dev-token"))
+	a.RequireDevice(capStatusReport)(h).ServeHTTP(w, deviceRequest("dev-token"))
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", w.Code)
 	}
-	if gotDevice == nil || gotDevice.AgentID != "agent-1" || gotDevice.BranchID != "brn-1" {
+	if gotDevice == nil || gotDevice.AgentID != "agent-1" || gotDevice.Attr("branch_id") != "brn-1" {
 		t.Fatalf("device not bound: %+v", gotDevice)
 	}
 	if !ok || gotTenant != "tnt-1" {
@@ -79,7 +90,7 @@ func TestRequireDevice_NoToken_401(t *testing.T) {
 	h := http.HandlerFunc(func(http.ResponseWriter, *http.Request) { called = true })
 
 	w := httptest.NewRecorder()
-	a.RequireDevice(CapPrintJobReceive)(h).ServeHTTP(w, deviceRequest(""))
+	a.RequireDevice(capJobReceive)(h).ServeHTTP(w, deviceRequest(""))
 
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", w.Code)
@@ -90,12 +101,12 @@ func TestRequireDevice_NoToken_401(t *testing.T) {
 }
 
 func TestRequireDevice_UnknownToken_401(t *testing.T) {
-	a := &Auth{deviceValidator: &mockDeviceValidator{rec: nil}} // validator finds nothing
+	a := &Auth{deviceValidator: &mockDeviceValidator{rec: nil}, deviceCaps: testDeviceCaps} // validator finds nothing
 	called := false
 	h := http.HandlerFunc(func(http.ResponseWriter, *http.Request) { called = true })
 
 	w := httptest.NewRecorder()
-	a.RequireDevice(CapPrintJobReceive)(h).ServeHTTP(w, deviceRequest("ghost"))
+	a.RequireDevice(capJobReceive)(h).ServeHTTP(w, deviceRequest("ghost"))
 
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401", w.Code)
@@ -106,9 +117,9 @@ func TestRequireDevice_UnknownToken_401(t *testing.T) {
 }
 
 func TestRequireDevice_NoValidator_401(t *testing.T) {
-	a := &Auth{} // device auth disabled
+	a := &Auth{deviceCaps: testDeviceCaps} // device auth disabled
 	w := httptest.NewRecorder()
-	a.RequireDevice(CapPrintJobReceive)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+	a.RequireDevice(capJobReceive)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		t.Error("next must not run")
 	})).ServeHTTP(w, deviceRequest("anything"))
 	if w.Code != http.StatusUnauthorized {
@@ -116,23 +127,52 @@ func TestRequireDevice_NoValidator_401(t *testing.T) {
 	}
 }
 
-func TestRequireDevice_NonDeviceCapability_Panics(t *testing.T) {
+func TestRequireDevice_UndeclaredCapability_Panics(t *testing.T) {
 	defer func() {
 		if recover() == nil {
-			t.Error("RequireDevice with a non-device capability must panic at wire time")
+			t.Error("RequireDevice with an undeclared capability must panic at wire time")
 		}
 	}()
 	deviceAuth(&DeviceRecord{}).RequireDevice("invoice:issue")
 }
 
+func TestNew_DeviceValidatorRequiresCapabilities(t *testing.T) {
+	_, err := New(Config{
+		Mode:          AuthModePassword,
+		SessionSecret: "test-secret-that-is-at-least-32-bytes-long!!",
+		SecureCookie:  true,
+		UserStore:     newMockUserStore(),
+		Devices:       DeviceConfig{Validator: &mockDeviceValidator{}},
+	})
+	if err == nil {
+		t.Fatal("expected error: Devices.Validator without Devices.Capabilities")
+	}
+}
+
+func TestNew_DeviceCapabilities_RejectWildcard(t *testing.T) {
+	_, err := New(Config{
+		Mode:          AuthModePassword,
+		SessionSecret: "test-secret-that-is-at-least-32-bytes-long!!",
+		SecureCookie:  true,
+		UserStore:     newMockUserStore(),
+		Devices:       DeviceConfig{Validator: &mockDeviceValidator{}, Capabilities: []string{"*"}},
+	})
+	if err == nil {
+		t.Fatal("expected error: '*' must not be a device capability")
+	}
+}
+
 func TestAuthenticateDevice_BuildsPrincipal(t *testing.T) {
-	rec := &DeviceRecord{AgentID: "a", Name: "n", TenantID: "t", BranchID: "b"}
+	rec := &DeviceRecord{AgentID: "a", Name: "n", TenantID: "t", Attrs: map[string]string{"branch_id": "b"}}
 	d, err := deviceAuth(rec).AuthenticateDevice(context.Background(), "tok")
 	if err != nil {
 		t.Fatalf("authenticate: %v", err)
 	}
-	if d.AgentID != "a" || d.TenantID != "t" || d.BranchID != "b" {
+	if d.AgentID != "a" || d.TenantID != "t" || d.Attr("branch_id") != "b" {
 		t.Fatalf("principal mismatch: %+v", d)
+	}
+	if !d.Can(capJobReceive) {
+		t.Fatal("authenticated device must hold the configured capabilities")
 	}
 }
 

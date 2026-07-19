@@ -111,14 +111,16 @@ func platformAuth(t *testing.T, role string, audit AuditSink) *Auth {
 		Mode:          AuthModePassword,
 		SessionSecret: "0123456789abcdef0123456789abcdef",
 		UserStore:     stubUserStore{},
-		SessionStore:  newMemStore(),
+		Sessions:      SessionConfig{Store: newMemStore()},
 		AuditSink:     audit,
-		PlatformAdminStore: &memPlatformStore{rec: &PlatformAdminRecord{
-			Email: "root@klutch.lk", Name: "Root", HashedPassword: pw, Role: role,
-			TOTPSecret: platformTOTPSecret, TOTPConfirmed: true,
-		}},
-		PlatformPolicy:      staticPlatformPolicy{},
-		EnableImpersonation: true,
+		Platform: PlatformConfig{
+			Store: &memPlatformStore{rec: &PlatformAdminRecord{
+				Email: "root@example.com", Name: "Root", HashedPassword: pw, Role: role,
+				TOTPSecret: platformTOTPSecret, TOTPConfirmed: true,
+			}},
+			Policy:              staticPlatformPolicy{},
+			EnableImpersonation: true,
+		},
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -130,7 +132,7 @@ func platformAuth(t *testing.T, role string, audit AuditSink) *Auth {
 func platformPasswordStep(t *testing.T, a *Auth, password string) *httptest.ResponseRecorder {
 	t.Helper()
 	rec := httptest.NewRecorder()
-	form := url.Values{"email": {"root@klutch.lk"}, "password": {password}}
+	form := url.Values{"email": {"root@example.com"}, "password": {password}}
 	req := httptest.NewRequest("POST", "/platform/login", strings.NewReader(form.Encode()))
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.RemoteAddr = "10.0.0.9:5555"
@@ -229,13 +231,13 @@ func TestPlatformLogin_TwoStepPasswordThenTOTP(t *testing.T) {
 func TestPlatformLogin_EnrollThenConfirm(t *testing.T) {
 	pw, _ := HashPassword("super-secret-pw")
 	store := &memPlatformStore{rec: &PlatformAdminRecord{
-		Email: "new@klutch.lk", Name: "New", HashedPassword: pw, Role: "support",
+		Email: "new@example.com", Name: "New", HashedPassword: pw, Role: "support",
 		// No TOTPSecret, not confirmed — a freshly created admin.
 	}}
 	a, err := New(Config{
 		Mode: AuthModePassword, SessionSecret: "0123456789abcdef0123456789abcdef",
-		UserStore: stubUserStore{}, SessionStore: newMemStore(),
-		PlatformAdminStore: store, PlatformPolicy: staticPlatformPolicy{},
+		UserStore: stubUserStore{}, Sessions: SessionConfig{Store: newMemStore()},
+		Platform: PlatformConfig{Store: store, Policy: staticPlatformPolicy{}},
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -243,7 +245,7 @@ func TestPlatformLogin_EnrollThenConfirm(t *testing.T) {
 
 	action := func() (string, *http.Cookie) {
 		rec := httptest.NewRecorder()
-		form := url.Values{"email": {"new@klutch.lk"}, "password": {"super-secret-pw"}}
+		form := url.Values{"email": {"new@example.com"}, "password": {"super-secret-pw"}}
 		req := httptest.NewRequest("POST", "/platform/login", strings.NewReader(form.Encode()))
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		req.RemoteAddr = "10.0.0.9:5555"
@@ -358,7 +360,7 @@ func TestImpersonation_PermGatedAndAudited(t *testing.T) {
 	audit := &capturingAudit{}
 	a := platformAuth(t, "support", audit) // support has platform:impersonate
 
-	admin := &PlatformAdmin{Email: "root@klutch.lk", Role: "support", permissions: []string{"platform:impersonate"}}
+	admin := &PlatformAdmin{Email: "root@example.com", Role: "support", permissions: []string{"platform:impersonate"}}
 	ctx, err := a.ImpersonationContext(context.Background(), admin, "tenant-123")
 	if err != nil {
 		t.Fatalf("impersonate: %v", err)

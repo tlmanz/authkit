@@ -6,7 +6,7 @@ import (
 	"strings"
 )
 
-// extractBearerToken reads an API key from the request.
+// extractBearerToken reads an API key or bearer token from the request.
 // Checks Authorization: Bearer <token> first, then X-API-Key as a fallback.
 func extractBearerToken(r *http.Request) string {
 	if v := r.Header.Get("Authorization"); strings.HasPrefix(v, "Bearer ") {
@@ -49,7 +49,7 @@ func (a *Auth) tryBearer(r *http.Request) *User {
 }
 
 // permsForRole resolves the permissions for (tenant, role), consulting the TTL
-// cache first. The tenant must already be set on ctx so a DB-backed, tenant-aware
+// cache first. The tenant must already be set on ctx so a tenant-aware
 // PolicyProvider scopes its lookup correctly.
 func (a *Auth) permsForRole(ctx context.Context, tenantID, role string) []string {
 	if role == "" {
@@ -85,10 +85,9 @@ func (a *Auth) inject(r *http.Request, u *User, forceResolve bool) *http.Request
 	return r.WithContext(ctx)
 }
 
-// RequireAuth is middleware that enforces a valid credential — either an API
-// key (via APIKeyValidator, if configured) or an OAuth session cookie.
-// Responds 401 when neither is present or valid.
-// On success it injects the User into the request context.
+// RequireAuth is middleware that enforces a valid credential — a bearer token
+// (access JWT or API key) or a session cookie. Responds 401 when neither is
+// present or valid. On success it injects the User into the request context.
 func (a *Auth) RequireAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if u := a.tryBearer(r); u != nil {
@@ -97,15 +96,15 @@ func (a *Auth) RequireAuth(next http.Handler) http.Handler {
 		}
 		u, err := a.loadSession(r.Context(), r)
 		if err != nil || u == nil {
-			http.Error(w, "unauthenticated", http.StatusUnauthorized)
+			a.writeError(w, r, http.StatusUnauthorized, ErrCodeUnauthenticated, "unauthenticated")
 			return
 		}
 		next.ServeHTTP(w, a.inject(r, u, false))
 	})
 }
 
-// Require is middleware that enforces both a valid credential (API key or
-// OAuth session) AND that the authenticated user holds the given permission.
+// Require is middleware that enforces both a valid credential (bearer or
+// session) AND that the authenticated user holds the given permission.
 // Returns 401 when there is no credential, 403 when the user lacks the permission.
 func (a *Auth) Require(permission string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
@@ -113,7 +112,7 @@ func (a *Auth) Require(permission string) func(http.Handler) http.Handler {
 			if u := a.tryBearer(r); u != nil {
 				r = a.inject(r, u, true)
 				if !u.Can(permission) {
-					http.Error(w, "forbidden", http.StatusForbidden)
+					a.writeError(w, r, http.StatusForbidden, ErrCodeForbidden, "forbidden")
 					return
 				}
 				next.ServeHTTP(w, r)
@@ -121,12 +120,12 @@ func (a *Auth) Require(permission string) func(http.Handler) http.Handler {
 			}
 			u, err := a.loadSession(r.Context(), r)
 			if err != nil || u == nil {
-				http.Error(w, "unauthenticated", http.StatusUnauthorized)
+				a.writeError(w, r, http.StatusUnauthorized, ErrCodeUnauthenticated, "unauthenticated")
 				return
 			}
 			r = a.inject(r, u, false)
 			if !u.Can(permission) {
-				http.Error(w, "forbidden", http.StatusForbidden)
+				a.writeError(w, r, http.StatusForbidden, ErrCodeForbidden, "forbidden")
 				return
 			}
 			next.ServeHTTP(w, r)
@@ -134,33 +133,33 @@ func (a *Auth) Require(permission string) func(http.Handler) http.Handler {
 	}
 }
 
-// RequireSessionAuth is like RequireAuth but rejects API key credentials.
-// Use this for routes that must only be accessed via an OAuth session
+// RequireSessionAuth is like RequireAuth but rejects bearer credentials.
+// Use this for routes that must only be accessed via a browser session
 // (e.g. /auth/me, UI-only management actions).
 func (a *Auth) RequireSessionAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		u, err := a.loadSession(r.Context(), r)
 		if err != nil || u == nil {
-			http.Error(w, "unauthenticated", http.StatusUnauthorized)
+			a.writeError(w, r, http.StatusUnauthorized, ErrCodeUnauthenticated, "unauthenticated")
 			return
 		}
 		next.ServeHTTP(w, a.inject(r, u, false))
 	})
 }
 
-// RequireSession is like Require but rejects API key credentials.
-// Use this for permission-gated management routes that must use OAuth sessions.
+// RequireSession is like Require but rejects bearer credentials.
+// Use this for permission-gated management routes that must use sessions.
 func (a *Auth) RequireSession(permission string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			u, err := a.loadSession(r.Context(), r)
 			if err != nil || u == nil {
-				http.Error(w, "unauthenticated", http.StatusUnauthorized)
+				a.writeError(w, r, http.StatusUnauthorized, ErrCodeUnauthenticated, "unauthenticated")
 				return
 			}
 			r = a.inject(r, u, false)
 			if !u.Can(permission) {
-				http.Error(w, "forbidden", http.StatusForbidden)
+				a.writeError(w, r, http.StatusForbidden, ErrCodeForbidden, "forbidden")
 				return
 			}
 			next.ServeHTTP(w, r)

@@ -40,14 +40,15 @@ type RefreshTokenStore interface {
 	// RevokeChain revokes every token sharing chainID (reuse response).
 	RevokeChain(ctx context.Context, chainID string) error
 	// RevokeAllForUser revokes every refresh token belonging to one user, so a
-	// credential change or "log out everywhere" cuts off the mobile axis too, not
-	// just cookie sessions. tenantID scopes the revoke; email identifies the user.
+	// credential change or "log out everywhere" cuts off the bearer axis too,
+	// not just cookie sessions. tenantID scopes the revoke; email identifies
+	// the user.
 	RevokeAllForUser(ctx context.Context, tenantID, email string) error
 }
 
 func (a *Auth) refreshTTL() time.Duration {
-	if a.cfg.RefreshTokenTTL > 0 {
-		return a.cfg.RefreshTokenTTL
+	if a.cfg.Tokens.RefreshTTL > 0 {
+		return a.cfg.Tokens.RefreshTTL
 	}
 	return 30 * 24 * time.Hour
 }
@@ -83,7 +84,7 @@ func (a *Auth) issueTokenPair(ctx context.Context, u *User) (access, refresh str
 		IssuedAt:  now,
 		ExpiresAt: now.Add(a.refreshTTL()),
 	}
-	if err := a.cfg.RefreshTokenStore.Create(ctx, rt); err != nil {
+	if err := a.cfg.Tokens.RefreshStore.Create(ctx, rt); err != nil {
 		return "", "", err
 	}
 	access, err = a.issueAccessToken(u)
@@ -96,21 +97,22 @@ func (a *Auth) issueTokenPair(ctx context.Context, u *User) (access, refresh str
 // RefreshAccessToken rotates a refresh token: it issues a new access + refresh
 // pair and invalidates the presented token. Reuse of a spent/revoked token
 // revokes the entire chain. Mount on: POST /token/refresh
-// Expects form value: refresh_token.
+// Fields: refresh_token.
 func (a *Auth) RefreshAccessToken(w http.ResponseWriter, r *http.Request) {
 	if !a.tokensEnabled() {
-		http.Error(w, "tokens not enabled", http.StatusNotFound)
+		a.writeError(w, r, http.StatusNotFound, ErrCodeNotEnabled, "tokens not enabled")
 		return
 	}
+	parseBody(r)
 	raw := r.FormValue("refresh_token")
 	if raw == "" {
-		writeTokenError(w, http.StatusBadRequest, "invalid_request", "missing refresh_token")
+		a.writeError(w, r, http.StatusBadRequest, ErrCodeInvalidRequest, "missing refresh_token")
 		return
 	}
 
-	rt, err := a.cfg.RefreshTokenStore.Get(r.Context(), raw)
+	rt, err := a.cfg.Tokens.RefreshStore.Get(r.Context(), raw)
 	if err != nil || rt == nil {
-		writeTokenError(w, http.StatusUnauthorized, "invalid_grant", "unknown refresh token")
+		a.writeError(w, r, http.StatusUnauthorized, ErrCodeInvalidGrant, "unknown refresh token")
 		return
 	}
 
@@ -118,13 +120,13 @@ func (a *Auth) RefreshAccessToken(w http.ResponseWriter, r *http.Request) {
 	// presented again ⇒ it was copied ⇒ revoke the whole chain.
 	if rt.UsedAt != nil || rt.RevokedAt != nil {
 		ctx := WithTenant(r.Context(), rt.TenantID)
-		_ = a.cfg.RefreshTokenStore.RevokeChain(ctx, rt.ChainID)
+		_ = a.cfg.Tokens.RefreshStore.RevokeChain(ctx, rt.ChainID)
 		a.emitAudit(ctx, AuditEvent{Type: AuditRevoke, TenantID: rt.TenantID, Actor: rt.UserEmail, At: nowFn(), Meta: map[string]any{"reason": "refresh_reuse", "chain": rt.ChainID}})
-		writeTokenError(w, http.StatusUnauthorized, "invalid_grant", "refresh token reuse detected")
+		a.writeError(w, r, http.StatusUnauthorized, ErrCodeInvalidGrant, "refresh token reuse detected")
 		return
 	}
 	if nowFn().After(rt.ExpiresAt) {
-		writeTokenError(w, http.StatusUnauthorized, "invalid_grant", "refresh token expired")
+		a.writeError(w, r, http.StatusUnauthorized, ErrCodeInvalidGrant, "refresh token expired")
 		return
 	}
 
@@ -133,15 +135,15 @@ func (a *Auth) RefreshAccessToken(w http.ResponseWriter, r *http.Request) {
 	// Rebuild the user (fresh tenant + role) for the new access token.
 	storedUser, err := a.cfg.UserStore.GetUserByEmail(r.Context(), rt.UserEmail)
 	if err != nil {
-		writeTokenError(w, http.StatusUnauthorized, "invalid_grant", "user no longer exists")
+		a.writeError(w, r, http.StatusUnauthorized, ErrCodeInvalidGrant, "user no longer exists")
 		return
 	}
 	role, _ := a.rbacProvider.RoleFor(ctx, rt.UserEmail)
-	u := &User{Email: rt.UserEmail, Name: storedUser.Name, TenantID: storedUser.TenantID, BranchID: storedUser.BranchID, Role: role}
+	u := &User{Email: rt.UserEmail, Name: storedUser.Name, TenantID: storedUser.TenantID, Attrs: cloneAttrs(storedUser.Attrs), Role: role}
 
 	next, err := newOpaqueToken()
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		a.writeError(w, r, http.StatusInternalServerError, ErrCodeServerError, "internal error")
 		return
 	}
 	now := nowFn()
@@ -154,21 +156,21 @@ func (a *Auth) RefreshAccessToken(w http.ResponseWriter, r *http.Request) {
 		IssuedAt:  now,
 		ExpiresAt: now.Add(a.refreshTTL()),
 	}
-	if err := a.cfg.RefreshTokenStore.Rotate(ctx, raw, child); err != nil {
-		writeTokenError(w, http.StatusUnauthorized, "invalid_grant", "refresh token already used")
+	if err := a.cfg.Tokens.RefreshStore.Rotate(ctx, raw, child); err != nil {
+		a.writeError(w, r, http.StatusUnauthorized, ErrCodeInvalidGrant, "refresh token already used")
 		return
 	}
 
 	access, err := a.issueAccessToken(u)
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		a.writeError(w, r, http.StatusInternalServerError, ErrCodeServerError, "internal error")
 		return
 	}
 	writeTokenResponse(w, access, next, a.accessTTL())
 }
 
 func (a *Auth) tokensEnabled() bool {
-	return a.cfg.EnableTokens && a.keyring != nil && a.cfg.RefreshTokenStore != nil
+	return a.cfg.Tokens.Enable && a.keyring != nil && a.cfg.Tokens.RefreshStore != nil
 }
 
 func writeTokenResponse(w http.ResponseWriter, access, refresh string, ttl time.Duration) {
@@ -178,8 +180,4 @@ func writeTokenResponse(w http.ResponseWriter, access, refresh string, ttl time.
 		"token_type":    "Bearer",
 		"expires_in":    int(ttl.Seconds()),
 	})
-}
-
-func writeTokenError(w http.ResponseWriter, status int, code, desc string) {
-	writeJSON(w, status, map[string]string{"error": code, "error_description": desc})
 }

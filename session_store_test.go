@@ -79,12 +79,14 @@ func (stubUserStore) UpdatePassword(context.Context, string, string) error { ret
 func newServerSessionAuth(t *testing.T, store SessionStore) *Auth {
 	t.Helper()
 	a, err := New(Config{
-		Mode:            AuthModePassword,
-		SessionSecret:   "0123456789abcdef0123456789abcdef",
-		UserStore:       stubUserStore{},
-		SessionStore:    store,
-		IdleTimeout:     30 * time.Minute,
-		AbsoluteTimeout: 2 * time.Hour,
+		Mode:          AuthModePassword,
+		SessionSecret: "0123456789abcdef0123456789abcdef",
+		UserStore:     stubUserStore{},
+		Sessions: SessionConfig{
+			Store:           store,
+			IdleTimeout:     30 * time.Minute,
+			AbsoluteTimeout: 2 * time.Hour,
+		},
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)

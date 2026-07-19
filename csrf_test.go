@@ -14,7 +14,7 @@ func csrfAuth(t *testing.T, enable bool) *Auth {
 		Mode:          AuthModePassword,
 		SessionSecret: "0123456789abcdef0123456789abcdef",
 		UserStore:     stubUserStore{},
-		EnableCSRF:    enable,
+		CSRF:          CSRFConfig{Enable: enable},
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)

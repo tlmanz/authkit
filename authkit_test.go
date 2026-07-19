@@ -13,9 +13,11 @@ import (
 
 func TestNew_ShortSecret_ReturnsError(t *testing.T) {
 	_, err := New(Config{
-		SessionSecret:   "too-short",
-		Providers:       []ProviderConfig{{Name: "github", ClientID: "id", ClientSecret: "s"}},
-		CallbackBaseURL: "https://example.com",
+		SessionSecret: "too-short",
+		OAuth: OAuthConfig{
+			Providers:       []ProviderConfig{{Name: "github", ClientID: "id", ClientSecret: "s"}},
+			CallbackBaseURL: "https://example.com",
+		},
 	})
 	if err == nil {
 		t.Fatal("expected error for short secret")
@@ -28,7 +30,9 @@ func TestNew_ShortSecret_ReturnsError(t *testing.T) {
 func TestNew_EmptyCallbackBaseURL_OAuthMode(t *testing.T) {
 	_, err := New(Config{
 		SessionSecret: "test-secret-that-is-at-least-32-bytes-long!!",
-		Providers:     []ProviderConfig{{Name: "github", ClientID: "id", ClientSecret: "s"}},
+		OAuth: OAuthConfig{
+			Providers: []ProviderConfig{{Name: "github", ClientID: "id", ClientSecret: "s"}},
+		},
 	})
 	if err == nil {
 		t.Fatal("expected error for empty CallbackBaseURL in OAuth mode")
@@ -40,9 +44,11 @@ func TestNew_EmptyCallbackBaseURL_OAuthMode(t *testing.T) {
 
 func TestNew_InvalidCallbackBaseURL(t *testing.T) {
 	_, err := New(Config{
-		SessionSecret:   "test-secret-that-is-at-least-32-bytes-long!!",
-		CallbackBaseURL: "not a url",
-		Providers:       []ProviderConfig{{Name: "github", ClientID: "id", ClientSecret: "s"}},
+		SessionSecret: "test-secret-that-is-at-least-32-bytes-long!!",
+		OAuth: OAuthConfig{
+			CallbackBaseURL: "not a url",
+			Providers:       []ProviderConfig{{Name: "github", ClientID: "id", ClientSecret: "s"}},
+		},
 	})
 	if err == nil {
 		t.Fatal("expected error for invalid CallbackBaseURL")
@@ -54,8 +60,10 @@ func TestNew_InvalidCallbackBaseURL(t *testing.T) {
 
 func TestNew_NoProviders_OAuthMode(t *testing.T) {
 	_, err := New(Config{
-		SessionSecret:   "test-secret-that-is-at-least-32-bytes-long!!",
-		CallbackBaseURL: "https://example.com",
+		SessionSecret: "test-secret-that-is-at-least-32-bytes-long!!",
+		OAuth: OAuthConfig{
+			CallbackBaseURL: "https://example.com",
+		},
 	})
 	if err == nil {
 		t.Fatal("expected error when no providers in OAuth mode")
@@ -67,10 +75,12 @@ func TestNew_NoProviders_OAuthMode(t *testing.T) {
 
 func TestNew_OAuthMode_Success(t *testing.T) {
 	auth, err := New(Config{
-		SessionSecret:   "test-secret-that-is-at-least-32-bytes-long!!",
-		CallbackBaseURL: "https://example.com",
-		SecureCookie:    true,
-		Providers:       []ProviderConfig{{Name: "github", ClientID: "id", ClientSecret: "s"}},
+		SessionSecret: "test-secret-that-is-at-least-32-bytes-long!!",
+		SecureCookie:  true,
+		OAuth: OAuthConfig{
+			CallbackBaseURL: "https://example.com",
+			Providers:       []ProviderConfig{{Name: "github", ClientID: "id", ClientSecret: "s"}},
+		},
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -88,12 +98,14 @@ func TestNew_OAuthMode_Success(t *testing.T) {
 
 func TestNew_CustomAfterURLs(t *testing.T) {
 	auth, err := New(Config{
-		SessionSecret:   "test-secret-that-is-at-least-32-bytes-long!!",
-		CallbackBaseURL: "https://example.com",
-		SecureCookie:    true,
-		Providers:       []ProviderConfig{{Name: "github", ClientID: "id", ClientSecret: "s"}},
-		AfterLoginURL:   "/dashboard",
-		AfterLogoutURL:  "/goodbye",
+		SessionSecret: "test-secret-that-is-at-least-32-bytes-long!!",
+		SecureCookie:  true,
+		OAuth: OAuthConfig{
+			CallbackBaseURL: "https://example.com",
+			Providers:       []ProviderConfig{{Name: "github", ClientID: "id", ClientSecret: "s"}},
+		},
+		AfterLoginURL:  "/dashboard",
+		AfterLogoutURL: "/goodbye",
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -129,10 +141,12 @@ func TestNew_InvalidRBACPolicy(t *testing.T) {
 
 func TestNew_UnsupportedProvider(t *testing.T) {
 	_, err := New(Config{
-		SessionSecret:   "test-secret-that-is-at-least-32-bytes-long!!",
-		CallbackBaseURL: "https://example.com",
-		SecureCookie:    true,
-		Providers:       []ProviderConfig{{Name: "twitter", ClientID: "id", ClientSecret: "s"}},
+		SessionSecret: "test-secret-that-is-at-least-32-bytes-long!!",
+		SecureCookie:  true,
+		OAuth: OAuthConfig{
+			CallbackBaseURL: "https://example.com",
+			Providers:       []ProviderConfig{{Name: "twitter", ClientID: "id", ClientSecret: "s"}},
+		},
 	})
 	if err == nil {
 		t.Fatal("expected error for unsupported provider")
@@ -144,12 +158,14 @@ func TestNew_UnsupportedProvider(t *testing.T) {
 
 func TestNew_BothMode_Success(t *testing.T) {
 	auth, err := New(Config{
-		Mode:            AuthModeBoth,
-		SessionSecret:   "test-secret-that-is-at-least-32-bytes-long!!",
-		CallbackBaseURL: "https://example.com",
-		SecureCookie:    true,
-		Providers:       []ProviderConfig{{Name: "github", ClientID: "id", ClientSecret: "s"}},
-		UserStore:       newMockUserStore(),
+		Mode:          AuthModeBoth,
+		SessionSecret: "test-secret-that-is-at-least-32-bytes-long!!",
+		SecureCookie:  true,
+		OAuth: OAuthConfig{
+			CallbackBaseURL: "https://example.com",
+			Providers:       []ProviderConfig{{Name: "github", ClientID: "id", ClientSecret: "s"}},
+		},
+		UserStore: newMockUserStore(),
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)

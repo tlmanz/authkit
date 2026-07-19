@@ -93,14 +93,16 @@ func (fixedRolePolicy) PermissionsForRole(context.Context, string) []string { re
 func twoFAAuth(t *testing.T, store TOTPStore) *Auth {
 	t.Helper()
 	a, err := New(Config{
-		Mode:               AuthModePassword,
-		SessionSecret:      "0123456789abcdef0123456789abcdef",
-		UserStore:          twoFAUserStore{},
-		SessionStore:       newMemStore(),
-		TOTPStore:          store,
-		Require2FAForRoles: []string{"owner", "manager"},
-		AppName:            "Klutch",
-		RBAC:               RBACConfig{Provider: fixedRolePolicy{}},
+		Mode:          AuthModePassword,
+		SessionSecret: "0123456789abcdef0123456789abcdef",
+		UserStore:     twoFAUserStore{},
+		Sessions:      SessionConfig{Store: newMemStore()},
+		TwoFactor: TwoFactorConfig{
+			Store:           store,
+			RequireForRoles: []string{"owner", "manager"},
+		},
+		AppName: "Example",
+		RBAC:    RBACConfig{Provider: fixedRolePolicy{}},
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)

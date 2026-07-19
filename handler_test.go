@@ -2,6 +2,7 @@ package authkit
 
 import (
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -62,7 +63,7 @@ func TestMe_WithContext_ReturnsUser(t *testing.T) {
 	a := &Auth{
 		store:        newCookieStore("test-secret-that-is-32-bytes-ok!", false),
 		rbacProvider: &rbac{},
-		log:          defaultLogger{},
+		log:          slog.Default(),
 	}
 
 	w := httptest.NewRecorder()
@@ -87,7 +88,7 @@ func TestMe_NoSession_Returns401(t *testing.T) {
 	a := &Auth{
 		store:        newCookieStore("test-secret-that-is-32-bytes-ok!", false),
 		rbacProvider: &rbac{},
-		log:          defaultLogger{},
+		log:          slog.Default(),
 	}
 
 	w := httptest.NewRecorder()
@@ -111,7 +112,7 @@ func TestLogout_RedirectsToAfterLogoutURL(t *testing.T) {
 		store:        newCookieStore("test-secret-that-is-32-bytes-ok!", false),
 		cfg:          Config{AfterLogoutURL: "/goodbye"},
 		rbacProvider: &rbac{},
-		log:          defaultLogger{},
+		log:          slog.Default(),
 	}
 
 	w := httptest.NewRecorder()
@@ -163,7 +164,7 @@ func TestLogout_NoSession_DoesNotPanic(t *testing.T) {
 	a := &Auth{
 		store: newCookieStore("test-secret-that-is-32-bytes-ok!", false),
 		cfg:   Config{AfterLogoutURL: "/"},
-		log:   defaultLogger{},
+		log:   slog.Default(),
 	}
 
 	w := httptest.NewRecorder()

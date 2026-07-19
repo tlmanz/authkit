@@ -17,15 +17,17 @@ var nowFn = time.Now
 type Session struct {
 	ID          string
 	TenantID    string
-	BranchID    string
 	Email       string
 	Name        string
 	Provider    string
 	Role        string
 	Permissions []string
 
-	// Platform marks a super-admin (platform principal) session — no tenant.
-	// Tenant and platform sessions use different cookies, so they never cross.
+	// Attrs carries the principal's host-defined attributes (see User.Attrs).
+	Attrs map[string]string
+
+	// Platform marks a platform-operator session — no tenant. Tenant and
+	// platform sessions use different cookies, so they never cross.
 	Platform bool
 
 	// CreatedAt anchors the absolute timeout; LastSeenAt anchors the idle
@@ -34,14 +36,14 @@ type Session struct {
 	LastSeenAt time.Time
 }
 
-// SessionStore is the revocable, server-side session backend (DB or Redis). The
-// host application implements it; authkit generates the opaque IDs and enforces
-// the idle/absolute timeouts.
+// SessionStore is the revocable, server-side session backend (Redis, a
+// database, ...). The host application implements it; authkit generates the
+// opaque IDs and enforces the idle/absolute timeouts.
 //
 // Get is called before the tenant is known (it resolves the session by its
 // unguessable ID), so implementations MUST be able to read by ID without a
-// tenant scope. Create/Touch/Revoke/RevokeAllForUser are always called with the
-// session's tenant already on the context.
+// tenant scope. Create/Touch/Revoke/RevokeAllForUser are always called with
+// the session's tenant already on the context.
 type SessionStore interface {
 	// Create persists a new session. Returns an error only on infrastructure failure.
 	Create(ctx context.Context, s *Session) error
@@ -64,15 +66,15 @@ const (
 )
 
 func (a *Auth) idleTimeout() time.Duration {
-	if a.cfg.IdleTimeout > 0 {
-		return a.cfg.IdleTimeout
+	if a.cfg.Sessions.IdleTimeout > 0 {
+		return a.cfg.Sessions.IdleTimeout
 	}
 	return defaultIdleTimeout
 }
 
 func (a *Auth) absoluteTimeout() time.Duration {
-	if a.cfg.AbsoluteTimeout > 0 {
-		return a.cfg.AbsoluteTimeout
+	if a.cfg.Sessions.AbsoluteTimeout > 0 {
+		return a.cfg.Sessions.AbsoluteTimeout
 	}
 	return defaultAbsoluteTimeout
 }
@@ -86,14 +88,7 @@ func newSessionID() (string, error) {
 	return base64.RawURLEncoding.EncodeToString(b[:]), nil
 }
 
-// sidCookieName uses the __Host- prefix in production (requires Secure + Path=/
-// + no Domain), which browsers reject over plain HTTP, so dev uses a plain name.
-func (a *Auth) sidCookieName() string {
-	if a.cfg.SecureCookie {
-		return "__Host-authkit_sid"
-	}
-	return "authkit_sid"
-}
+func (a *Auth) sidCookieName() string { return a.cookieName("sid") }
 
 func (a *Auth) writeSIDCookie(w http.ResponseWriter, id string) {
 	http.SetCookie(w, &http.Cookie{
@@ -129,11 +124,11 @@ func (a *Auth) readSID(r *http.Request) string {
 
 // establishServerSession rotates to a fresh session ID on login (fixation
 // prevention): it revokes any pre-existing session, creates a new record, and
-// sets the cookie. ctx must already carry the user's tenant (so the store's
-// tenant-scoped insert passes RLS).
+// sets the cookie. ctx must already carry the user's tenant (so a
+// tenant-scoped store applies the right scope).
 func (a *Auth) establishServerSession(ctx context.Context, w http.ResponseWriter, r *http.Request, u *User) error {
 	if old := a.readSID(r); old != "" {
-		_ = a.cfg.SessionStore.Revoke(ctx, old)
+		_ = a.cfg.Sessions.Store.Revoke(ctx, old)
 	}
 	id, err := newSessionID()
 	if err != nil {
@@ -143,16 +138,16 @@ func (a *Auth) establishServerSession(ctx context.Context, w http.ResponseWriter
 	s := &Session{
 		ID:          id,
 		TenantID:    u.TenantID,
-		BranchID:    u.BranchID,
 		Email:       u.Email,
 		Name:        u.Name,
 		Provider:    u.Provider,
 		Role:        u.Role,
 		Permissions: u.permissions,
+		Attrs:       cloneAttrs(u.Attrs),
 		CreatedAt:   now,
 		LastSeenAt:  now,
 	}
-	if err := a.cfg.SessionStore.Create(ctx, s); err != nil {
+	if err := a.cfg.Sessions.Store.Create(ctx, s); err != nil {
 		return err
 	}
 	a.writeSIDCookie(w, id)
@@ -167,7 +162,7 @@ func (a *Auth) serverSessionUser(ctx context.Context, r *http.Request) (*User, e
 	if id == "" {
 		return nil, nil
 	}
-	s, err := a.cfg.SessionStore.Get(ctx, id)
+	s, err := a.cfg.Sessions.Store.Get(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -178,12 +173,12 @@ func (a *Auth) serverSessionUser(ctx context.Context, r *http.Request) (*User, e
 	now := nowFn()
 	if now.Sub(s.CreatedAt) > a.absoluteTimeout() || now.Sub(s.LastSeenAt) > a.idleTimeout() {
 		// Expired — revoke (scoped to the session's tenant) and treat as logged out.
-		_ = a.cfg.SessionStore.Revoke(WithTenant(ctx, s.TenantID), id)
+		_ = a.cfg.Sessions.Store.Revoke(WithTenant(ctx, s.TenantID), id)
 		return nil, nil
 	}
 
 	if now.Sub(s.LastSeenAt) > sessionTouchInterval {
-		_ = a.cfg.SessionStore.Touch(WithTenant(ctx, s.TenantID), id, now)
+		_ = a.cfg.Sessions.Store.Touch(WithTenant(ctx, s.TenantID), id, now)
 	}
 
 	return &User{
@@ -192,7 +187,7 @@ func (a *Auth) serverSessionUser(ctx context.Context, r *http.Request) (*User, e
 		Provider:    s.Provider,
 		Role:        s.Role,
 		TenantID:    s.TenantID,
-		BranchID:    s.BranchID,
+		Attrs:       cloneAttrs(s.Attrs),
 		permissions: s.Permissions,
 	}, nil
 }
@@ -200,9 +195,9 @@ func (a *Auth) serverSessionUser(ctx context.Context, r *http.Request) (*User, e
 // destroyServerSession revokes the current session and clears the cookie.
 func (a *Auth) destroyServerSession(ctx context.Context, w http.ResponseWriter, r *http.Request) {
 	if id := a.readSID(r); id != "" {
-		// Resolve the tenant from the session so the scoped delete passes RLS.
-		if s, _ := a.cfg.SessionStore.Get(ctx, id); s != nil {
-			_ = a.cfg.SessionStore.Revoke(WithTenant(ctx, s.TenantID), id)
+		// Resolve the tenant from the session so the scoped delete applies.
+		if s, _ := a.cfg.Sessions.Store.Get(ctx, id); s != nil {
+			_ = a.cfg.Sessions.Store.Revoke(WithTenant(ctx, s.TenantID), id)
 		}
 	}
 	a.clearSIDCookie(w)
@@ -210,10 +205,10 @@ func (a *Auth) destroyServerSession(ctx context.Context, w http.ResponseWriter, 
 
 // ── unified entry points (branch between server-side store and legacy cookie) ─
 
-// saveSession persists the authenticated user — server-side when a SessionStore
-// is configured, otherwise the legacy encrypted cookie.
+// saveSession persists the authenticated user — server-side when a session
+// Store is configured, otherwise the legacy encrypted cookie.
 func (a *Auth) saveSession(ctx context.Context, w http.ResponseWriter, r *http.Request, u *User) error {
-	if a.cfg.SessionStore != nil {
+	if a.cfg.Sessions.Store != nil {
 		return a.establishServerSession(ctx, w, r, u)
 	}
 	return saveUserToSession(a.store, w, r, u)
@@ -221,7 +216,7 @@ func (a *Auth) saveSession(ctx context.Context, w http.ResponseWriter, r *http.R
 
 // loadSession resolves the user from the request's session.
 func (a *Auth) loadSession(ctx context.Context, r *http.Request) (*User, error) {
-	if a.cfg.SessionStore != nil {
+	if a.cfg.Sessions.Store != nil {
 		return a.serverSessionUser(ctx, r)
 	}
 	return userFromSession(a.store, r, a.log)
@@ -229,19 +224,32 @@ func (a *Auth) loadSession(ctx context.Context, r *http.Request) (*User, error) 
 
 // endSession terminates the current session.
 func (a *Auth) endSession(ctx context.Context, w http.ResponseWriter, r *http.Request) {
-	if a.cfg.SessionStore != nil {
+	if a.cfg.Sessions.Store != nil {
 		a.destroyServerSession(ctx, w, r)
 		return
 	}
 	clearSession(a.store, w, r)
 }
 
+// EstablishSession mints a session for u exactly as a successful login would:
+// it rotates the session ID (fixation prevention), persists the record, and
+// sets the cookie. It exists for host-driven login flows — an ephemeral trial
+// principal, an SSO bridge, a development bypass — that authenticate outside
+// authkit's built-in handlers but must produce a first-class session.
+//
+// The caller is responsible for having authenticated the principal. u must
+// carry Email, Role, TenantID (when multi-tenant), and — via SetPermissions —
+// the resolved permission list; ctx must carry the user's tenant (WithTenant).
+func (a *Auth) EstablishSession(ctx context.Context, w http.ResponseWriter, r *http.Request, u *User) error {
+	return a.saveSession(ctx, w, r, u)
+}
+
 // RevokeUserSessions revokes every server-side session for a user — the
-// "log out everywhere" / fired-employee path. No-op when no SessionStore is
+// "log out everywhere" / offboarding path. No-op when no session Store is
 // configured. ctx must carry the user's tenant.
 func (a *Auth) RevokeUserSessions(ctx context.Context, tenantID, email string) error {
-	if a.cfg.SessionStore == nil {
+	if a.cfg.Sessions.Store == nil {
 		return nil
 	}
-	return a.cfg.SessionStore.RevokeAllForUser(ctx, tenantID, email)
+	return a.cfg.Sessions.Store.RevokeAllForUser(ctx, tenantID, email)
 }

@@ -100,19 +100,21 @@ func testSigningKeys(t *testing.T, kids ...string) []SigningKey {
 func tokenAuth(t *testing.T, keys []SigningKey, store RefreshTokenStore) *Auth {
 	t.Helper()
 	a, err := New(Config{
-		Mode:              AuthModePassword,
-		SessionSecret:     "0123456789abcdef0123456789abcdef",
-		UserStore:         twoFAUserStore{}, // owner@shop.lk, tenant t1
-		RBAC:              RBACConfig{Provider: fixedRolePolicy{}},
-		SessionStore:      newMemStore(),
-		EnableTokens:      true,
-		SigningKeys:       keys,
-		RefreshTokenStore: store,
-		AccessTokenTTL:    15 * time.Minute,
-		RefreshTokenTTL:   24 * time.Hour,
-		TokenIssuer:       "https://api.klutch.lk",
-		TokenClientID:     "klutch-mobile",
-		TokenRedirectURIs: []string{"klutch://cb"},
+		Mode:          AuthModePassword,
+		SessionSecret: "0123456789abcdef0123456789abcdef",
+		UserStore:     twoFAUserStore{}, // owner@shop.lk, tenant t1
+		RBAC:          RBACConfig{Provider: fixedRolePolicy{}},
+		Sessions:      SessionConfig{Store: newMemStore()},
+		Tokens: TokenConfig{
+			Enable:       true,
+			SigningKeys:  keys,
+			RefreshStore: store,
+			AccessTTL:    15 * time.Minute,
+			RefreshTTL:   24 * time.Hour,
+			Issuer:       "https://api.example.com",
+			ClientID:     "example-mobile",
+			RedirectURIs: []string{"example://cb"},
+		},
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -266,12 +268,14 @@ func TestPKCE_CodeIsSingleUse(t *testing.T) {
 	a, err := New(Config{
 		Mode: AuthModePassword, SessionSecret: "0123456789abcdef0123456789abcdef",
 		UserStore: twoFAUserStore{}, RBAC: RBACConfig{Provider: fixedRolePolicy{}},
-		SessionStore: newMemStore(), EnableTokens: true,
-		SigningKeys: testSigningKeys(t, "k1"), RefreshTokenStore: newMemRefresh(),
-		AccessTokenTTL: 15 * time.Minute, RefreshTokenTTL: 24 * time.Hour,
-		TokenIssuer: "https://api.klutch.lk", TokenClientID: "klutch-mobile",
-		TokenRedirectURIs: []string{"klutch://cb"},
-		AuthCodeStore:     newMemAuthCodes(),
+		Sessions: SessionConfig{Store: newMemStore()},
+		Tokens: TokenConfig{
+			Enable: true, SigningKeys: testSigningKeys(t, "k1"), RefreshStore: newMemRefresh(),
+			AccessTTL: 15 * time.Minute, RefreshTTL: 24 * time.Hour,
+			Issuer: "https://api.example.com", ClientID: "example-mobile",
+			RedirectURIs: []string{"example://cb"},
+			AuthCodes:    newMemAuthCodes(),
+		},
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -287,8 +291,8 @@ func TestPKCE_CodeIsSingleUse(t *testing.T) {
 
 	rec = httptest.NewRecorder()
 	au := url.Values{
-		"response_type": {"code"}, "client_id": {"klutch-mobile"},
-		"redirect_uri": {"klutch://cb"}, "code_challenge": {challenge},
+		"response_type": {"code"}, "client_id": {"example-mobile"},
+		"redirect_uri": {"example://cb"}, "code_challenge": {challenge},
 		"code_challenge_method": {"S256"},
 	}
 	req := httptest.NewRequest("GET", "/authorize?"+au.Encode(), nil)
@@ -301,7 +305,7 @@ func TestPKCE_CodeIsSingleUse(t *testing.T) {
 		rec := httptest.NewRecorder()
 		form := url.Values{
 			"grant_type": {"authorization_code"}, "code": {code},
-			"code_verifier": {verifier}, "redirect_uri": {"klutch://cb"},
+			"code_verifier": {verifier}, "redirect_uri": {"example://cb"},
 		}
 		req := httptest.NewRequest("POST", "/token", strings.NewReader(form.Encode()))
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -332,8 +336,8 @@ func TestPKCE_AuthorizeAndExchange(t *testing.T) {
 	// GET /authorize → 303 redirect with a code.
 	rec = httptest.NewRecorder()
 	au := url.Values{
-		"response_type": {"code"}, "client_id": {"klutch-mobile"},
-		"redirect_uri": {"klutch://cb"}, "code_challenge": {challenge},
+		"response_type": {"code"}, "client_id": {"example-mobile"},
+		"redirect_uri": {"example://cb"}, "code_challenge": {challenge},
 		"code_challenge_method": {"S256"}, "state": {"xyz"},
 	}
 	req := httptest.NewRequest("GET", "/authorize?"+au.Encode(), nil)
@@ -352,7 +356,7 @@ func TestPKCE_AuthorizeAndExchange(t *testing.T) {
 		rec := httptest.NewRecorder()
 		form := url.Values{
 			"grant_type": {"authorization_code"}, "code": {code},
-			"code_verifier": {verifier}, "redirect_uri": {"klutch://cb"},
+			"code_verifier": {verifier}, "redirect_uri": {"example://cb"},
 		}
 		req := httptest.NewRequest("POST", "/token", strings.NewReader(form.Encode()))
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")

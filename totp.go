@@ -48,7 +48,7 @@ type TOTPStore interface {
 // configured TOTPStore to this — a store that does not implement it simply
 // makes those endpoints return 501, leaving the base enroll/verify flow intact.
 // Kept separate from TOTPStore so adding management never breaks existing
-// implementers (e.g. the platform-admin store, whose 2FA is mandatory).
+// implementers (e.g. a platform-admin store, whose 2FA is mandatory).
 type TOTPManager interface {
 	// Disable removes the user's TOTP secret and all recovery codes (turning 2FA
 	// off). Idempotent: a no-op when none is stored.
@@ -59,22 +59,16 @@ type TOTPManager interface {
 }
 
 const (
-	recoveryCodeCount   = 10
-	twofaPendingTTL     = 5 * time.Minute
-	totpPendingCookieNm = "authkit_2fa_pending"
+	recoveryCodeCount = 10
+	twofaPendingTTL   = 5 * time.Minute
 )
 
 // requires2FA reports whether the given role must complete a TOTP step.
 func (a *Auth) requires2FA(role string) bool {
-	return slices.Contains(a.cfg.Require2FAForRoles, role)
+	return slices.Contains(a.cfg.TwoFactor.RequireForRoles, role)
 }
 
-func (a *Auth) twofaCookieName() string {
-	if a.cfg.SecureCookie {
-		return "__Host-" + totpPendingCookieNm
-	}
-	return totpPendingCookieNm
-}
+func (a *Auth) twofaCookieName() string { return a.cookieName("2fa_pending") }
 
 type pendingClaims struct {
 	Email string `json:"e"`
@@ -101,8 +95,8 @@ func (a *Auth) readPendingToken(r *http.Request) (string, bool) {
 
 // parsePendingToken validates a signed pending-2FA token value (the same token
 // minted by issuePendingToken) and returns the email it binds. Shared by the
-// cookie-based web flow (readPendingToken) and the mobile flow, which carries
-// the token in the request body instead of a cookie.
+// cookie-based web flow (readPendingToken) and the native token flow, which
+// carries the token in the request body instead of a cookie.
 func (a *Auth) parsePendingToken(value string) (string, bool) {
 	payload, mac, ok := strings.Cut(value, ".")
 	if !ok || subtle.ConstantTimeCompare([]byte(mac), []byte(a.sign(payload))) != 1 {
@@ -145,10 +139,10 @@ func (a *Auth) clearPendingCookie(w http.ResponseWriter) {
 // requires 2FA. It sets the pending cookie and tells the client whether to
 // enroll or verify. It does NOT mint a full session.
 func (a *Auth) beginTwoFactor(ctx context.Context, w http.ResponseWriter, email string) {
-	_, confirmed, err := a.cfg.TOTPStore.Secret(ctx, tenantFromCtxOrEmpty(ctx), email)
+	_, confirmed, err := a.cfg.TwoFactor.Store.Secret(ctx, tenantFromCtxOrEmpty(ctx), email)
 	if err != nil {
-		a.log.Error("authkit: totp secret lookup failed: %v", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		a.log.Error("totp secret lookup failed", "err", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": ErrCodeServerError, "error_description": "internal error"})
 		return
 	}
 	a.setPendingCookie(w, a.issuePendingToken(email))
@@ -163,19 +157,20 @@ func (a *Auth) beginTwoFactor(ctx context.Context, w http.ResponseWriter, email 
 
 // Verify2FA completes a pending login by validating a TOTP code or a recovery
 // code, then establishes the session. Mount on: POST /auth/2fa/verify
-// Expects form values: code (6-digit TOTP) OR recovery_code.
+// Expects fields: code (6-digit TOTP) OR recovery_code.
 func (a *Auth) Verify2FA(w http.ResponseWriter, r *http.Request) {
-	if a.cfg.TOTPStore == nil {
-		http.Error(w, "2fa not enabled", http.StatusNotFound)
+	if a.cfg.TwoFactor.Store == nil {
+		a.writeError(w, r, http.StatusNotFound, ErrCodeNotEnabled, "2fa not enabled")
 		return
 	}
+	parseBody(r)
 	email, ok := a.readPendingToken(r)
 	if !ok {
-		http.Error(w, "no pending 2fa challenge", http.StatusUnauthorized)
+		a.writeError(w, r, http.StatusUnauthorized, ErrCodeInvalidChallenge, "no pending 2fa challenge")
 		return
 	}
 
-	tkey := throttleKey(email, clientIP(r))
+	tkey := throttleKey(email, a.clientIP(r))
 	if !a.throttleAllow(w, r, tkey) {
 		return
 	}
@@ -183,44 +178,44 @@ func (a *Auth) Verify2FA(w http.ResponseWriter, r *http.Request) {
 	// Resolve the tenant for this user so TOTP access is tenant-scoped.
 	storedUser, err := a.cfg.UserStore.GetUserByEmail(r.Context(), email)
 	if err != nil {
-		http.Error(w, "invalid challenge", http.StatusUnauthorized)
+		a.writeError(w, r, http.StatusUnauthorized, ErrCodeInvalidChallenge, "invalid challenge")
 		return
 	}
 	ctx := WithTenant(r.Context(), storedUser.TenantID)
 
 	if !a.validate2FA(ctx, storedUser.TenantID, email, r) {
 		a.throttleFailure(ctx, tkey)
-		http.Error(w, "invalid code", http.StatusUnauthorized)
+		a.writeError(w, r, http.StatusUnauthorized, ErrCodeInvalidCode, "invalid code")
 		return
 	}
 	// The first successful verification confirms a pending enrollment (idempotent
 	// for an already-confirmed secret), so future logins go straight to verify.
-	if err := a.cfg.TOTPStore.Confirm(ctx, storedUser.TenantID, email); err != nil {
-		a.log.Error("authkit: totp confirm failed: %v", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+	if err := a.cfg.TwoFactor.Store.Confirm(ctx, storedUser.TenantID, email); err != nil {
+		a.log.Error("totp confirm failed", "err", err)
+		a.writeError(w, r, http.StatusInternalServerError, ErrCodeServerError, "internal error")
 		return
 	}
 	a.throttleReset(ctx, tkey)
 	a.clearPendingCookie(w)
 
 	if err := a.establishLoginSession(ctx, w, r, email, storedUser); err != nil {
-		a.log.Error("authkit: session error after 2fa: %v", err)
-		http.Error(w, "session error", http.StatusInternalServerError)
+		a.log.Error("session error after 2fa", "err", err)
+		a.writeError(w, r, http.StatusInternalServerError, ErrCodeServerError, "session error")
 		return
 	}
 	// Honor "remember this device": mint a trusted-device token so future logins
 	// from this browser skip the TOTP step (revocable + expiring).
 	a.rememberDevice(ctx, w, r, storedUser.TenantID, email)
-	// Audit the completed web login for a 2FA (owner/manager, money) role: this is
-	// the highest-value login and the mobile 2FA path already audits it (§6.5#9).
-	a.emitAudit(ctx, AuditEvent{Type: AuditLogin, TenantID: storedUser.TenantID, Actor: email, Subject: email, IP: clientIP(r), At: nowFn(), Meta: map[string]any{"twofa": true}})
+	// Audit the completed login for a 2FA-required role: this is the
+	// highest-value login and the native 2FA path already audits it.
+	a.emitAudit(ctx, AuditEvent{Type: AuditLogin, TenantID: storedUser.TenantID, Actor: email, Subject: email, IP: a.clientIP(r), At: nowFn(), Meta: map[string]any{"twofa": true}})
 	http.Redirect(w, r, a.cfg.AfterLoginURL, http.StatusSeeOther)
 }
 
 // validate2FA checks the submitted TOTP code or recovery code.
 func (a *Auth) validate2FA(ctx context.Context, tenantID, email string, r *http.Request) bool {
 	if rc := strings.TrimSpace(r.FormValue("recovery_code")); rc != "" {
-		ok, err := a.cfg.TOTPStore.ConsumeRecovery(ctx, tenantID, email, hashRecoveryCode(rc))
+		ok, err := a.cfg.TwoFactor.Store.ConsumeRecovery(ctx, tenantID, email, hashRecoveryCode(rc))
 		return err == nil && ok
 	}
 	code := strings.TrimSpace(r.FormValue("code"))
@@ -231,7 +226,7 @@ func (a *Auth) validate2FA(ctx context.Context, tenantID, email string, r *http.
 	// first valid code is exactly what confirms a pending enrollment (Verify2FA
 	// calls Confirm on success). A confirmed flag here would make confirmation
 	// impossible.
-	secret, _, err := a.cfg.TOTPStore.Secret(ctx, tenantID, email)
+	secret, _, err := a.cfg.TwoFactor.Store.Secret(ctx, tenantID, email)
 	if err != nil || secret == "" {
 		return false
 	}
@@ -243,10 +238,10 @@ func (a *Auth) validate2FA(ctx context.Context, tenantID, email string, r *http.
 	// intercepted-and-replayed code is rejected. Fail open on a store error so a
 	// transient outage doesn't lock a legitimate login out (the throttler + the
 	// short window keep the residual risk low).
-	if g, has := a.cfg.TOTPStore.(TOTPReplayGuard); has {
+	if g, has := a.cfg.TwoFactor.Store.(TOTPReplayGuard); has {
 		claimed, cerr := g.ClaimTOTPTimestep(ctx, tenantID, email, ts)
 		if cerr != nil {
-			a.log.Error("authkit: totp replay claim: %v", cerr)
+			a.log.Error("totp replay claim failed", "err", cerr)
 		} else if !claimed {
 			return false
 		}
@@ -259,10 +254,11 @@ func (a *Auth) validate2FA(ctx context.Context, tenantID, email string, r *http.
 // voluntary enrollment), and returns the otpauth URL + recovery codes to show
 // once. Mount on: POST /auth/2fa/enroll
 func (a *Auth) Enroll2FA(w http.ResponseWriter, r *http.Request) {
-	if a.cfg.TOTPStore == nil {
-		http.Error(w, "2fa not enabled", http.StatusNotFound)
+	if a.cfg.TwoFactor.Store == nil {
+		a.writeError(w, r, http.StatusNotFound, ErrCodeNotEnabled, "2fa not enabled")
 		return
 	}
+	parseBody(r)
 
 	email, ok := a.readPendingToken(r)
 	if !ok {
@@ -273,13 +269,13 @@ func (a *Auth) Enroll2FA(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if !ok {
-		http.Error(w, "not authenticated", http.StatusUnauthorized)
+		a.writeError(w, r, http.StatusUnauthorized, ErrCodeUnauthenticated, "not authenticated")
 		return
 	}
 
 	storedUser, err := a.cfg.UserStore.GetUserByEmail(r.Context(), email)
 	if err != nil {
-		http.Error(w, "invalid user", http.StatusUnauthorized)
+		a.writeError(w, r, http.StatusUnauthorized, ErrCodeInvalidChallenge, "invalid user")
 		return
 	}
 	ctx := WithTenant(r.Context(), storedUser.TenantID)
@@ -289,24 +285,24 @@ func (a *Auth) Enroll2FA(w http.ResponseWriter, r *http.Request) {
 	// new secret and thereby bypass 2FA. Resetting an active authenticator goes
 	// through DisableTwoFactor first, which requires an authenticated session.
 	// Mirrors PlatformEnroll2FA.
-	if _, confirmed, err := a.cfg.TOTPStore.Secret(ctx, storedUser.TenantID, email); err == nil && confirmed {
-		http.Error(w, "2fa already enrolled", http.StatusConflict)
+	if _, confirmed, err := a.cfg.TwoFactor.Store.Secret(ctx, storedUser.TenantID, email); err == nil && confirmed {
+		a.writeError(w, r, http.StatusConflict, ErrCodeConflict, "2fa already enrolled")
 		return
 	}
 
 	key, err := totp.Generate(totp.GenerateOpts{Issuer: a.appName(), AccountName: email})
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		a.writeError(w, r, http.StatusInternalServerError, ErrCodeServerError, "internal error")
 		return
 	}
 	plain, hashes, err := generateRecoveryCodes(recoveryCodeCount)
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		a.writeError(w, r, http.StatusInternalServerError, ErrCodeServerError, "internal error")
 		return
 	}
-	if err := a.cfg.TOTPStore.Enroll(ctx, storedUser.TenantID, email, key.Secret(), hashes); err != nil {
-		a.log.Error("authkit: totp enroll failed: %v", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+	if err := a.cfg.TwoFactor.Store.Enroll(ctx, storedUser.TenantID, email, key.Secret(), hashes); err != nil {
+		a.log.Error("totp enroll failed", "err", err)
+		a.writeError(w, r, http.StatusInternalServerError, ErrCodeServerError, "internal error")
 		return
 	}
 
@@ -347,12 +343,6 @@ func hashRecoveryCode(code string) string {
 	norm := strings.ToUpper(strings.NewReplacer("-", "", " ", "").Replace(strings.TrimSpace(code)))
 	sum := sha256.Sum256([]byte(norm))
 	return hex.EncodeToString(sum[:])
-}
-
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
 }
 
 // tenantFromCtxOrEmpty returns the tenant on ctx (or "").

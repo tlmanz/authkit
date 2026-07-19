@@ -40,29 +40,31 @@ func (m *memTrusted) RevokeAllForUser(_ context.Context, _, email string) error 
 func passwordTokenAuth(t *testing.T, totpStore TOTPStore, require2FA bool, trusted TrustedDeviceStore) *Auth {
 	t.Helper()
 	cfg := Config{
-		Mode:              AuthModePassword,
-		SessionSecret:     "0123456789abcdef0123456789abcdef",
-		UserStore:         twoFAUserStore{}, // owner@shop.lk / correct-horse, tenant t1
-		RBAC:              RBACConfig{Provider: fixedRolePolicy{}},
-		SessionStore:      newMemStore(),
-		EnableTokens:      true,
-		SigningKeys:       testSigningKeys(t, "k1"),
-		RefreshTokenStore: newMemRefresh(),
-		AccessTokenTTL:    15 * time.Minute,
-		RefreshTokenTTL:   24 * time.Hour,
-		TokenIssuer:       "https://app.klutch.lk",
-		TokenClientID:     "klutch-mobile",
-		TokenRedirectURIs: []string{"lk.klutch.app://oauth/callback"},
-		AppName:           "Klutch",
+		Mode:          AuthModePassword,
+		SessionSecret: "0123456789abcdef0123456789abcdef",
+		UserStore:     twoFAUserStore{}, // owner@shop.lk / correct-horse, tenant t1
+		RBAC:          RBACConfig{Provider: fixedRolePolicy{}},
+		Sessions:      SessionConfig{Store: newMemStore()},
+		Tokens: TokenConfig{
+			Enable:       true,
+			SigningKeys:  testSigningKeys(t, "k1"),
+			RefreshStore: newMemRefresh(),
+			AccessTTL:    15 * time.Minute,
+			RefreshTTL:   24 * time.Hour,
+			Issuer:       "https://app.example.com",
+			ClientID:     "example-mobile",
+			RedirectURIs: []string{"com.example.app://oauth/callback"},
+		},
+		AppName: "Example",
 	}
 	if totpStore != nil {
-		cfg.TOTPStore = totpStore
+		cfg.TwoFactor.Store = totpStore
 	}
 	if require2FA {
-		cfg.Require2FAForRoles = []string{"owner", "manager"}
+		cfg.TwoFactor.RequireForRoles = []string{"owner", "manager"}
 	}
 	if trusted != nil {
-		cfg.TrustedDeviceStore = trusted
+		cfg.TwoFactor.TrustedDevices = trusted
 	}
 	a, err := New(cfg)
 	if err != nil {

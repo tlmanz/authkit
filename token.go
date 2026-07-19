@@ -13,7 +13,7 @@ import (
 )
 
 // SigningKey is one Ed25519 key in the rotation ring. The current key (the first
-// in Config.SigningKeys) signs new access tokens; all keys verify, so a key can
+// in Tokens.SigningKeys) signs new access tokens; all keys verify, so a key can
 // be retired without invalidating tokens it already signed.
 type SigningKey struct {
 	KID     string
@@ -37,7 +37,7 @@ type keyring struct {
 
 func newKeyring(keys []SigningKey) (*keyring, error) {
 	if len(keys) == 0 {
-		return nil, errors.New("authkit: EnableTokens requires at least one SigningKey")
+		return nil, errors.New("authkit: Tokens.Enable requires at least one SigningKey")
 	}
 	kr := &keyring{signer: keys[0], public: make(map[string]ed25519.PublicKey, len(keys))}
 	for _, k := range keys {
@@ -55,49 +55,47 @@ func newKeyring(keys []SigningKey) (*keyring, error) {
 // the token — they are resolved server-side per request (so changes take effect
 // within one access-token TTL).
 //
-// Provider mirrors User.Provider (e.g. "password", "demo") so principal-type
-// checks that key off it (like a "demo tenant" guard) see the same value for a
-// bearer-token request as they would for a cookie session — see
-// verifyAccessToken. Omitted from older tokens minted before this field
-// existed; those simply verify with Provider == "", identical to today.
+// Provider mirrors User.Provider so principal-origin checks see the same value
+// for a bearer-token request as they would for a cookie session. Attrs
+// round-trips the host-defined principal attributes.
 type accessClaims struct {
-	Name     string `json:"name,omitempty"`
-	Provider string `json:"provider,omitempty"`
-	TenantID string `json:"tenant_id"`
-	BranchID string `json:"branch_id,omitempty"`
-	Role     string `json:"role"`
+	Name     string            `json:"name,omitempty"`
+	Provider string            `json:"provider,omitempty"`
+	TenantID string            `json:"tenant_id,omitempty"`
+	Role     string            `json:"role"`
+	Attrs    map[string]string `json:"attrs,omitempty"`
 	jwt.RegisteredClaims
 }
 
 func (a *Auth) accessTTL() time.Duration {
-	if a.cfg.AccessTokenTTL > 0 {
-		return a.cfg.AccessTokenTTL
+	if a.cfg.Tokens.AccessTTL > 0 {
+		return a.cfg.Tokens.AccessTTL
 	}
 	return 15 * time.Minute
 }
 
 // issueAccessToken signs a short-lived JWT for u with the current key, using
-// the configured AccessTokenTTL.
+// the configured AccessTTL.
 func (a *Auth) issueAccessToken(u *User) (string, error) {
 	return a.issueAccessTokenWithTTL(u, a.accessTTL())
 }
 
 // issueAccessTokenWithTTL signs a JWT for u with an explicit lifetime instead
-// of the configured AccessTokenTTL — see IssueAccessTokenOnly, whose callers
-// need a token bound to something shorter-lived than the principal itself
-// (e.g. an ephemeral tenant's own remaining lifetime).
+// of the configured AccessTTL — see MintAccessToken, whose callers need a
+// token bound to something shorter-lived than the principal itself (e.g. an
+// ephemeral principal's own remaining lifetime).
 func (a *Auth) issueAccessTokenWithTTL(u *User, ttl time.Duration) (string, error) {
 	now := nowFn()
 	claims := accessClaims{
 		Name:     u.Name,
 		Provider: u.Provider,
 		TenantID: u.TenantID,
-		BranchID: u.BranchID,
+		Attrs:    u.Attrs,
 		Role:     u.Role,
 		RegisteredClaims: jwt.RegisteredClaims{
-			Issuer:    a.cfg.TokenIssuer,
+			Issuer:    a.cfg.Tokens.Issuer,
 			Subject:   u.Email,
-			Audience:  jwt.ClaimStrings{a.cfg.TokenClientID},
+			Audience:  jwt.ClaimStrings{a.cfg.Tokens.ClientID},
 			IssuedAt:  jwt.NewNumericDate(now),
 			ExpiresAt: jwt.NewNumericDate(now.Add(ttl)),
 		},
@@ -105,6 +103,27 @@ func (a *Auth) issueAccessTokenWithTTL(u *User, ttl time.Duration) (string, erro
 	tok := jwt.NewWithClaims(jwt.SigningMethodEdDSA, claims)
 	tok.Header["kid"] = a.keyring.signer.KID
 	return tok.SignedString(a.keyring.signer.Private)
+}
+
+// MintAccessToken signs and returns a single access-token JWT for u — no
+// refresh token — with an explicit ttl. It exists for host-driven flows that
+// issue tokens to principals not backed by UserStore (an ephemeral trial
+// principal, a synthetic service identity): minting a refresh token for such
+// a principal would hand out a credential that could never be redeemed, since
+// the refresh flow re-resolves the principal through UserStore.
+//
+// u.Provider should be set to whatever distinguishes this principal type —
+// it round-trips through the token so origin guards see the same value as for
+// a session carrying the same Provider. ttl must be positive; callers exist
+// precisely because they need a deliberately-computed lifetime.
+func (a *Auth) MintAccessToken(u *User, ttl time.Duration) (string, error) {
+	if !a.tokensEnabled() {
+		return "", errors.New("authkit: tokens not enabled")
+	}
+	if ttl <= 0 {
+		return "", errors.New("authkit: MintAccessToken requires a positive ttl")
+	}
+	return a.issueAccessTokenWithTTL(u, ttl)
 }
 
 // verifyAccessToken validates a JWT against the keyring and returns the bearer's
@@ -121,8 +140,8 @@ func (a *Auth) verifyAccessToken(raw string) (*User, error) {
 		return pub, nil
 	},
 		jwt.WithValidMethods([]string{"EdDSA"}),
-		jwt.WithIssuer(a.cfg.TokenIssuer),
-		jwt.WithAudience(a.cfg.TokenClientID),
+		jwt.WithIssuer(a.cfg.Tokens.Issuer),
+		jwt.WithAudience(a.cfg.Tokens.ClientID),
 		jwt.WithTimeFunc(nowFn),
 	)
 	if err != nil {
@@ -134,7 +153,7 @@ func (a *Auth) verifyAccessToken(raw string) (*User, error) {
 		Provider: claims.Provider,
 		Role:     claims.Role,
 		TenantID: claims.TenantID,
-		BranchID: claims.BranchID,
+		Attrs:    claims.Attrs,
 	}, nil
 }
 
@@ -142,7 +161,7 @@ func (a *Auth) verifyAccessToken(raw string) (*User, error) {
 // the identity. Returns nil when tokens are disabled, no bearer is present, or
 // the token is invalid — callers then fall through to other credentials.
 func (a *Auth) tryTokenAuth(r *http.Request) *User {
-	if !a.cfg.EnableTokens || a.keyring == nil {
+	if !a.cfg.Tokens.Enable || a.keyring == nil {
 		return nil
 	}
 	raw := extractBearerToken(r)
@@ -158,9 +177,9 @@ func (a *Auth) tryTokenAuth(r *http.Request) *User {
 
 // JWKS serves the public verification keys. Mount on:
 // GET /.well-known/jwks.json
-func (a *Auth) JWKS(w http.ResponseWriter, _ *http.Request) {
+func (a *Auth) JWKS(w http.ResponseWriter, r *http.Request) {
 	if a.keyring == nil {
-		http.Error(w, "tokens not enabled", http.StatusNotFound)
+		a.writeError(w, r, http.StatusNotFound, ErrCodeNotEnabled, "tokens not enabled")
 		return
 	}
 	type jwk struct {

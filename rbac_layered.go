@@ -3,6 +3,7 @@ package authkit
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strings"
 )
 
@@ -42,18 +43,18 @@ type UserRoleStore interface {
 type LayeredPolicyProvider struct {
 	yaml  *rbac
 	store UserRoleStore
-	log   Logger // nil → silent
+	log   *slog.Logger // nil → silent
 }
 
-// WithLogger configures a Logger for LayeredPolicyProvider. When set, DB
+// WithLogger configures a logger for LayeredPolicyProvider. When set, DB
 // errors during role lookups are logged so operators can detect store outages.
 //
 // Example:
 //
 //	provider, err := authkit.NewLayeredProvider("policy.yaml", store,
-//	    authkit.WithLogger(myLogger),
+//	    authkit.WithLogger(slog.Default()),
 //	)
-func WithLogger(l Logger) func(*LayeredPolicyProvider) {
+func WithLogger(l *slog.Logger) func(*LayeredPolicyProvider) {
 	return func(p *LayeredPolicyProvider) { p.log = l }
 }
 
@@ -92,7 +93,7 @@ func (l *LayeredPolicyProvider) RoleFor(ctx context.Context, email string) (stri
 	role, perms, found, err := l.store.GetOverride(ctx, email)
 	if err != nil {
 		if l.log != nil {
-			l.log.Error("authkit: role override lookup failed for %q: %v — falling back to YAML baseline", email, err)
+			l.log.Error("role override lookup failed — falling back to YAML baseline", "email", email, "err", err)
 		}
 		// fall through to YAML
 	} else if found {

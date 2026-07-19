@@ -6,8 +6,8 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
-	"encoding/json"
 	"net/http"
+	"slices"
 	"strings"
 )
 
@@ -17,6 +17,7 @@ import (
 // matches the cookie and (b) the token carries a valid HMAC, so an attacker who
 // can neither read the cookie (same-origin policy) nor mint a signed token
 // (no secret) cannot forge a request — even from a subdomain that can set cookies.
+// Optionally, CSRFConfig.TrustedOrigins adds an Origin allow-list check on top.
 //
 // Token-authenticated requests (Authorization: Bearer / X-API-Key) carry no
 // ambient cookie credential and are therefore not CSRF-prone; they are skipped.
@@ -25,12 +26,7 @@ const (
 	csrfHeader = "X-CSRF-Token"
 )
 
-func (a *Auth) csrfCookieName() string {
-	if a.cfg.SecureCookie {
-		return "__Host-csrf_token"
-	}
-	return "csrf_token"
-}
+func (a *Auth) csrfCookieName() string { return a.cookieName("csrf") }
 
 // issueCSRFToken returns a fresh token of the form base64(rand).base64(hmac).
 func (a *Auth) issueCSRFToken() (string, error) {
@@ -43,7 +39,7 @@ func (a *Auth) issueCSRFToken() (string, error) {
 }
 
 // sign returns the URL-safe base64 HMAC-SHA256 of msg under SessionSecret. Used
-// for CSRF tokens and the short-lived 2FA-pending token.
+// for CSRF tokens and the short-lived pending-step tokens.
 func (a *Auth) sign(msg string) string {
 	m := hmac.New(sha256.New, []byte(a.cfg.SessionSecret))
 	m.Write([]byte(msg))
@@ -87,13 +83,28 @@ func isSafeMethod(m string) bool {
 	}
 }
 
+// originAllowed applies the optional TrustedOrigins check: when configured and
+// the request carries an Origin header, it must match the allow-list. Requests
+// without an Origin header (same-origin form posts in some browsers, curl) are
+// left to the double-submit check alone.
+func (a *Auth) originAllowed(r *http.Request) bool {
+	if len(a.cfg.CSRF.TrustedOrigins) == 0 {
+		return true
+	}
+	origin := r.Header.Get("Origin")
+	if origin == "" || origin == "null" {
+		return origin == ""
+	}
+	return slices.Contains(a.cfg.CSRF.TrustedOrigins, origin)
+}
+
 // CSRF is middleware enforcing the double-submit check on unsafe methods. On
 // safe methods it ensures a valid token cookie is present (bootstrapping the
-// SPA). It is a pass-through when EnableCSRF is false or the request is
+// SPA). It is a pass-through when CSRF.Enable is false or the request is
 // token-authenticated.
 func (a *Auth) CSRF(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !a.cfg.EnableCSRF || extractBearerToken(r) != "" {
+		if !a.cfg.CSRF.Enable || extractBearerToken(r) != "" {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -111,11 +122,16 @@ func (a *Auth) CSRF(next http.Handler) http.Handler {
 			return
 		}
 
+		if !a.originAllowed(r) {
+			a.writeError(w, r, http.StatusForbidden, ErrCodeCSRF, "origin not allowed")
+			return
+		}
+
 		hdr := r.Header.Get(csrfHeader)
 		if hdr == "" || cookieTok == "" ||
 			subtle.ConstantTimeCompare([]byte(hdr), []byte(cookieTok)) != 1 ||
 			!a.verifyCSRFToken(hdr) {
-			http.Error(w, "csrf token invalid", http.StatusForbidden)
+			a.writeError(w, r, http.StatusForbidden, ErrCodeCSRF, "csrf token invalid")
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -130,11 +146,10 @@ func (a *Auth) CSRFToken(w http.ResponseWriter, r *http.Request) {
 		var err error
 		tok, err = a.issueCSRFToken()
 		if err != nil {
-			http.Error(w, "internal error", http.StatusInternalServerError)
+			a.writeError(w, r, http.StatusInternalServerError, ErrCodeServerError, "internal error")
 			return
 		}
 		a.setCSRFCookie(w, tok)
 	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]string{"csrfToken": tok})
+	writeJSON(w, http.StatusOK, map[string]string{"csrfToken": tok})
 }

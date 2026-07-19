@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-// PKCE Authorization Code flow for the public mobile client. The authorization
+// PKCE Authorization Code flow for a public native client. The authorization
 // code is a short-lived signed token bound to the PKCE challenge, the redirect
 // URI, and the authenticated user — so only the app holding the matching
 // verifier can redeem it. Login happens via the normal session before reaching
@@ -70,26 +70,26 @@ func (a *Auth) verifyAuthCode(code string) (*authCodeClaims, bool) {
 // redirects back to the app. Mount on: GET /authorize
 func (a *Auth) Authorize(w http.ResponseWriter, r *http.Request) {
 	if !a.tokensEnabled() {
-		http.Error(w, "tokens not enabled", http.StatusNotFound)
+		a.writeError(w, r, http.StatusNotFound, ErrCodeNotEnabled, "tokens not enabled")
 		return
 	}
 	q := r.URL.Query()
 	if q.Get("response_type") != "code" {
-		http.Error(w, "unsupported_response_type", http.StatusBadRequest)
+		a.writeError(w, r, http.StatusBadRequest, ErrCodeInvalidRequest, "unsupported response_type")
 		return
 	}
-	if q.Get("client_id") != a.cfg.TokenClientID {
-		http.Error(w, "invalid_client", http.StatusBadRequest)
+	if q.Get("client_id") != a.cfg.Tokens.ClientID {
+		a.writeError(w, r, http.StatusBadRequest, ErrCodeInvalidRequest, "invalid client_id")
 		return
 	}
 	redirect := q.Get("redirect_uri")
-	if !slices.Contains(a.cfg.TokenRedirectURIs, redirect) {
-		http.Error(w, "invalid redirect_uri", http.StatusBadRequest)
+	if !slices.Contains(a.cfg.Tokens.RedirectURIs, redirect) {
+		a.writeError(w, r, http.StatusBadRequest, ErrCodeInvalidRequest, "invalid redirect_uri")
 		return
 	}
 	challenge := q.Get("code_challenge")
 	if challenge == "" || q.Get("code_challenge_method") != "S256" {
-		http.Error(w, "invalid code_challenge", http.StatusBadRequest)
+		a.writeError(w, r, http.StatusBadRequest, ErrCodeInvalidRequest, "invalid code_challenge")
 		return
 	}
 
@@ -109,7 +109,7 @@ func (a *Auth) Authorize(w http.ResponseWriter, r *http.Request) {
 	code := a.issueAuthCode(u.Email, challenge, redirect)
 	dest, err := url.Parse(redirect)
 	if err != nil {
-		http.Error(w, "invalid redirect_uri", http.StatusBadRequest)
+		a.writeError(w, r, http.StatusBadRequest, ErrCodeInvalidRequest, "invalid redirect_uri")
 		return
 	}
 	rq := dest.Query()
@@ -123,60 +123,61 @@ func (a *Auth) Authorize(w http.ResponseWriter, r *http.Request) {
 
 // IssueToken exchanges an authorization code (+ PKCE verifier) for an access +
 // refresh token pair. Mount on: POST /token
-// Expects form values: grant_type=authorization_code, code, code_verifier,
-// redirect_uri.
+// Fields: grant_type=authorization_code, code, code_verifier, redirect_uri.
 func (a *Auth) IssueToken(w http.ResponseWriter, r *http.Request) {
 	if !a.tokensEnabled() {
-		http.Error(w, "tokens not enabled", http.StatusNotFound)
+		a.writeError(w, r, http.StatusNotFound, ErrCodeNotEnabled, "tokens not enabled")
 		return
 	}
+	parseBody(r)
 	if r.FormValue("grant_type") != "authorization_code" {
-		writeTokenError(w, http.StatusBadRequest, "unsupported_grant_type", "expected authorization_code")
+		a.writeError(w, r, http.StatusBadRequest, ErrCodeUnsupportedGrant, "expected authorization_code")
 		return
 	}
 
 	claims, ok := a.verifyAuthCode(r.FormValue("code"))
 	if !ok {
-		writeTokenError(w, http.StatusBadRequest, "invalid_grant", "invalid or expired code")
+		a.writeError(w, r, http.StatusBadRequest, ErrCodeInvalidGrant, "invalid or expired code")
 		return
 	}
 	if r.FormValue("redirect_uri") != claims.Redirect {
-		writeTokenError(w, http.StatusBadRequest, "invalid_grant", "redirect_uri mismatch")
+		a.writeError(w, r, http.StatusBadRequest, ErrCodeInvalidGrant, "redirect_uri mismatch")
 		return
 	}
 	if !verifyPKCE(r.FormValue("code_verifier"), claims.Challenge) {
-		writeTokenError(w, http.StatusBadRequest, "invalid_grant", "PKCE verification failed")
+		a.writeError(w, r, http.StatusBadRequest, ErrCodeInvalidGrant, "PKCE verification failed")
 		return
 	}
 	// Single-use (opt-in): claim the code's jti so it cannot be redeemed twice
 	// within its TTL. A failed claim (already redeemed) is treated as an invalid
 	// grant. Fail closed on a store error: a redemption we can't prove is unique
 	// is refused rather than risk issuing two token chains from one code.
-	if a.cfg.AuthCodeStore != nil {
-		fresh, cerr := a.cfg.AuthCodeStore.ClaimAuthCode(r.Context(), claims.JTI, time.Unix(claims.Exp, 0))
+	if a.cfg.Tokens.AuthCodes != nil {
+		fresh, cerr := a.cfg.Tokens.AuthCodes.ClaimAuthCode(r.Context(), claims.JTI, time.Unix(claims.Exp, 0))
 		if cerr != nil {
-			a.log.Error("authkit: auth code claim: %v", cerr)
-			writeTokenError(w, http.StatusBadRequest, "invalid_grant", "code could not be validated")
+			a.log.Error("auth code claim failed", "err", cerr)
+			a.writeError(w, r, http.StatusBadRequest, ErrCodeInvalidGrant, "code could not be validated")
 			return
 		}
 		if !fresh {
-			writeTokenError(w, http.StatusBadRequest, "invalid_grant", "authorization code already used")
+			a.writeError(w, r, http.StatusBadRequest, ErrCodeInvalidGrant, "authorization code already used")
 			return
 		}
 	}
 
 	storedUser, err := a.cfg.UserStore.GetUserByEmail(r.Context(), claims.Email)
 	if err != nil {
-		writeTokenError(w, http.StatusBadRequest, "invalid_grant", "user no longer exists")
+		a.writeError(w, r, http.StatusBadRequest, ErrCodeInvalidGrant, "user no longer exists")
 		return
 	}
 	ctx := WithTenant(r.Context(), storedUser.TenantID)
 	role, _ := a.rbacProvider.RoleFor(ctx, claims.Email)
-	u := &User{Email: claims.Email, Name: storedUser.Name, TenantID: storedUser.TenantID, BranchID: storedUser.BranchID, Role: role}
+	u := &User{Email: claims.Email, Name: storedUser.Name, TenantID: storedUser.TenantID, Attrs: cloneAttrs(storedUser.Attrs), Role: role}
 
 	access, refresh, err := a.issueTokenPair(ctx, u)
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		a.log.Error("token pair issue failed", "err", err)
+		a.writeError(w, r, http.StatusInternalServerError, ErrCodeServerError, "internal error")
 		return
 	}
 	writeTokenResponse(w, access, refresh, a.accessTTL())

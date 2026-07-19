@@ -3,6 +3,7 @@ package authkit
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -393,9 +394,9 @@ func TestLogin_OAuthModeDisabled(t *testing.T) {
 func TestNew_DefaultModeIsOAuth(t *testing.T) {
 	// Empty Mode should default to OAuth and require CallbackBaseURL/providers.
 	_, err := New(Config{
-		SessionSecret:   "test-secret-that-is-at-least-32-bytes-long!!",
-		SecureCookie:    true,
-		CallbackBaseURL: "https://example.com",
+		SessionSecret: "test-secret-that-is-at-least-32-bytes-long!!",
+		SecureCookie:  true,
+		OAuth:         OAuthConfig{CallbackBaseURL: "https://example.com"},
 	})
 	if err == nil {
 		t.Fatal("expected error when no providers given in default (OAuth) mode")
@@ -434,12 +435,14 @@ func TestNew_PasswordMode_RequiresUserStore(t *testing.T) {
 func TestNew_BothMode_RequiresUserStoreAndProviders(t *testing.T) {
 	// Missing UserStore.
 	_, err := New(Config{
-		Mode:            AuthModeBoth,
-		SessionSecret:   "test-secret-that-is-at-least-32-bytes-long!!",
-		SecureCookie:    true,
-		CallbackBaseURL: "https://example.com",
-		Providers: []ProviderConfig{
-			{Name: "github", ClientID: "id", ClientSecret: "secret"},
+		Mode:          AuthModeBoth,
+		SessionSecret: "test-secret-that-is-at-least-32-bytes-long!!",
+		SecureCookie:  true,
+		OAuth: OAuthConfig{
+			CallbackBaseURL: "https://example.com",
+			Providers: []ProviderConfig{
+				{Name: "github", ClientID: "id", ClientSecret: "secret"},
+			},
 		},
 	})
 	if err == nil {
@@ -448,11 +451,11 @@ func TestNew_BothMode_RequiresUserStoreAndProviders(t *testing.T) {
 
 	// Missing providers.
 	_, err = New(Config{
-		Mode:            AuthModeBoth,
-		SessionSecret:   "test-secret-that-is-at-least-32-bytes-long!!",
-		SecureCookie:    true,
-		CallbackBaseURL: "https://example.com",
-		UserStore:       newMockUserStore(),
+		Mode:          AuthModeBoth,
+		SessionSecret: "test-secret-that-is-at-least-32-bytes-long!!",
+		SecureCookie:  true,
+		OAuth:         OAuthConfig{CallbackBaseURL: "https://example.com"},
+		UserStore:     newMockUserStore(),
 	})
 	if err == nil {
 		t.Fatal("expected error when no providers in both mode")
@@ -483,7 +486,7 @@ func TestRegister_InternalStoreError(t *testing.T) {
 		},
 		store:        newCookieStore(testSecret, false),
 		rbacProvider: newRBAC(Policy{}),
-		log:          defaultLogger{},
+		log:          slog.Default(),
 	}
 
 	w := httptest.NewRecorder()
@@ -507,7 +510,7 @@ func TestLogin_InternalStoreError(t *testing.T) {
 		},
 		store:        newCookieStore(testSecret, false),
 		rbacProvider: newRBAC(Policy{}),
-		log:          defaultLogger{},
+		log:          slog.Default(),
 	}
 
 	w := httptest.NewRecorder()
@@ -533,7 +536,7 @@ func TestRegister_BothMode_Works(t *testing.T) {
 		},
 		store:        newCookieStore(testSecret, false),
 		rbacProvider: newRBAC(Policy{}),
-		log:          defaultLogger{},
+		log:          slog.Default(),
 	}
 
 	w := httptest.NewRecorder()
@@ -565,7 +568,7 @@ func TestLogin_BothMode_Works(t *testing.T) {
 		},
 		store:        newCookieStore(testSecret, false),
 		rbacProvider: newRBAC(Policy{}),
-		log:          defaultLogger{},
+		log:          slog.Default(),
 	}
 
 	w := httptest.NewRecorder()

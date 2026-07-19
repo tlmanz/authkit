@@ -6,7 +6,7 @@ import (
 )
 
 // AuditEvent is a single auditable security event emitted by authkit. The host
-// application wires an AuditSink to persist these to its audit log (§7.7).
+// application wires an AuditSink to persist these to its audit log.
 //
 // Type is one of the well-known constants below. TenantID is empty for platform
 // principals and for pre-tenant events (e.g. a failed login before the user is
@@ -23,8 +23,7 @@ type AuditEvent struct {
 	Meta     map[string]any
 }
 
-// Well-known audit event types. Phases wire these as the corresponding features
-// land; the set matches §7.7.
+// Well-known audit event types.
 const (
 	AuditLogin            = "login"
 	AuditLogout           = "logout"

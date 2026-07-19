@@ -1,4 +1,4 @@
-module github.com/tlmanz/authkit
+module github.com/tlmanz/authkit/v2
 
 go 1.25.0
 

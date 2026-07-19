@@ -105,7 +105,7 @@ func (r *rbac) RoleFor(_ context.Context, email string) (string, []string) {
 }
 
 // PermissionsForRole implements PolicyProvider. The YAML provider is not
-// tenant-aware (single-shop fallback), so ctx is ignored.
+// tenant-aware (single-tenant fallback), so ctx is ignored.
 func (r *rbac) PermissionsForRole(_ context.Context, role string) []string {
 	return r.permissionsForRole(role)
 }

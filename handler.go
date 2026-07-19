@@ -21,8 +21,8 @@ func (a *Auth) BeginAuth(w http.ResponseWriter, r *http.Request) {
 func (a *Auth) Callback(w http.ResponseWriter, r *http.Request) {
 	gothUser, err := gothic.CompleteUserAuth(w, r)
 	if err != nil {
-		a.log.Error("authkit: OAuth callback error: %v", err)
-		http.Error(w, "authentication failed", http.StatusUnauthorized)
+		a.log.Error("oauth callback failed", "err", err)
+		a.writeError(w, r, http.StatusUnauthorized, ErrCodeUnauthenticated, "authentication failed")
 		return
 	}
 
@@ -39,7 +39,8 @@ func (a *Auth) Callback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := a.saveSession(r.Context(), w, r, u); err != nil {
-		http.Error(w, "session error", http.StatusInternalServerError)
+		a.log.Error("session save failed after oauth login", "err", err)
+		a.writeError(w, r, http.StatusInternalServerError, ErrCodeServerError, "session error")
 		return
 	}
 
@@ -64,8 +65,7 @@ func (a *Auth) Me(w http.ResponseWriter, r *http.Request) {
 		var err error
 		u, err = a.loadSession(r.Context(), r)
 		if err != nil || u == nil {
-			w.Header().Set("Content-Type", "application/json")
-			http.Error(w, `{"error":"unauthenticated"}`, http.StatusUnauthorized)
+			a.writeError(w, r, http.StatusUnauthorized, ErrCodeUnauthenticated, "unauthenticated")
 			return
 		}
 	}

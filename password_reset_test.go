@@ -2,6 +2,7 @@ package authkit
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -52,16 +53,15 @@ func buildResetAuth() (*Auth, *mockUserStore, *captureDelivery, *memSessionStore
 	ss := newMemStore()
 	a := &Auth{
 		cfg: Config{
-			Mode:               AuthModePassword,
-			SessionSecret:      testSecret,
-			UserStore:          us,
-			SessionStore:       ss,
-			PasswordResetStore: newMemResetStore(),
-			ResetDelivery:      cd,
+			Mode:          AuthModePassword,
+			SessionSecret: testSecret,
+			UserStore:     us,
+			Sessions:      SessionConfig{Store: ss},
+			Reset:         ResetConfig{Store: newMemResetStore(), Delivery: cd},
 		},
 		store:        newCookieStore(testSecret, false),
 		rbacProvider: newRBAC(Policy{}),
-		log:          defaultLogger{},
+		log:          slog.Default(),
 		audit:        NopAuditSink{},
 	}
 	return a, us, cd, ss

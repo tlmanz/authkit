@@ -11,8 +11,8 @@ import (
 	"time"
 )
 
-// Password reset (§6, "Forget Password"). The flow is the same for both
-// principal axes — tenant users and platform admins — and shares one store:
+// Password reset ("forgot password"). The flow is the same for both principal
+// axes — regular users and platform admins — and shares one store:
 //
 //  1. forgot: the client posts an email. We ALWAYS answer 200 with the same body
 //     (no user enumeration). When the email matches a principal, a single-use,
@@ -45,7 +45,7 @@ type ResetToken struct {
 }
 
 // PasswordResetStore persists single-use password-reset tokens. The raw token is
-// delivered out-of-band (email today, SMS later); only its hash is stored.
+// delivered out-of-band (email, SMS, ...); only its hash is stored.
 // Consume MUST be atomic and single-use.
 type PasswordResetStore interface {
 	// CreateResetToken stores a hashed token bound to (email, kind) with expiry.
@@ -68,7 +68,7 @@ type ResetRequest struct {
 }
 
 // ResetDelivery delivers a password-reset token to the principal. The host owns
-// the channel (email now, SMS later) — authkit is channel-agnostic. Sending is
+// the channel (email, SMS, ...) — authkit is channel-agnostic. Sending is
 // best-effort from the request's perspective: the "forgot" endpoint logs a
 // delivery error but still returns 200, so it leaks neither which emails exist
 // nor which channel succeeded.
@@ -77,14 +77,14 @@ type ResetDelivery interface {
 }
 
 func (a *Auth) passwordResetTTL() time.Duration {
-	if a.cfg.PasswordResetTTL > 0 {
-		return a.cfg.PasswordResetTTL
+	if a.cfg.Reset.TTL > 0 {
+		return a.cfg.Reset.TTL
 	}
 	return defaultPasswordResetTTL
 }
 
 func (a *Auth) resetEnabled() bool {
-	return a.cfg.PasswordResetStore != nil && a.cfg.ResetDelivery != nil
+	return a.cfg.Reset.Store != nil && a.cfg.Reset.Delivery != nil
 }
 
 // newResetToken returns a 256-bit URL-safe raw token and its SHA-256 hash.
@@ -104,8 +104,8 @@ func hashResetToken(raw string) string {
 
 // IssueResetToken mints, stores, and delivers a reset token for (email, kind).
 // It is the shared core of the self-service forgot-password handlers and any
-// admin-initiated reset (an owner resetting a staff member). It returns the raw
-// token so an authenticated caller can surface the reset link directly; the
+// admin-initiated reset (an operator resetting a staff member). It returns the
+// raw token so an authenticated caller can surface the reset link directly; the
 // public handlers discard it. A delivery error is returned (the caller decides);
 // a store error is returned without attempting delivery.
 func (a *Auth) IssueResetToken(ctx context.Context, email, name, kind string) (string, error) {
@@ -114,29 +114,30 @@ func (a *Auth) IssueResetToken(ctx context.Context, email, name, kind string) (s
 		return "", err
 	}
 	ttl := a.passwordResetTTL()
-	if err := a.cfg.PasswordResetStore.CreateResetToken(ctx, hash, email, kind, nowFn().Add(ttl)); err != nil {
+	if err := a.cfg.Reset.Store.CreateResetToken(ctx, hash, email, kind, nowFn().Add(ttl)); err != nil {
 		return "", err
 	}
-	derr := a.cfg.ResetDelivery.SendPasswordReset(ctx, ResetRequest{Email: email, Name: name, Kind: kind, Token: raw, TTL: ttl})
+	derr := a.cfg.Reset.Delivery.SendPasswordReset(ctx, ResetRequest{Email: email, Name: name, Kind: kind, Token: raw, TTL: ttl})
 	return raw, derr
 }
 
-// ForgotPassword starts self-service recovery for a tenant user. It ALWAYS
-// responds 200 with the same body whether or not the email exists, leaking
-// nothing about which emails are registered. Mount on: POST /auth/password/forgot.
-// Expects form: email.
+// ForgotPassword starts self-service recovery for a user. It ALWAYS responds
+// 200 with the same body whether or not the email exists, leaking nothing
+// about which emails are registered. Mount on: POST /auth/password/forgot.
+// Fields: email.
 func (a *Auth) ForgotPassword(w http.ResponseWriter, r *http.Request) {
 	if !a.resetEnabled() {
-		http.Error(w, "password reset not enabled", http.StatusNotFound)
+		a.writeError(w, r, http.StatusNotFound, ErrCodeNotEnabled, "password reset not enabled")
 		return
 	}
+	parseBody(r)
 	email := strings.ToLower(strings.TrimSpace(r.FormValue("email")))
 	// Rate-limit before doing any email-existence-dependent work: this blunts
 	// reset email-bombing of a victim and the timing side channel that would
 	// otherwise distinguish a registered email (which does a store write +
 	// delivery) from an unknown one. Namespaced so it never shares the login
 	// lockout counter. The 429 reveals nothing about whether the email exists.
-	tkey := "pwreset|" + throttleKey(email, clientIP(r))
+	tkey := "pwreset|" + throttleKey(email, a.clientIP(r))
 	if !a.throttleAllow(w, r, tkey) {
 		return
 	}
@@ -145,9 +146,9 @@ func (a *Auth) ForgotPassword(w http.ResponseWriter, r *http.Request) {
 		if u, err := a.cfg.UserStore.GetUserByEmail(r.Context(), email); err == nil {
 			ctx := WithTenant(r.Context(), u.TenantID)
 			if _, derr := a.IssueResetToken(ctx, email, u.Name, ResetKindUser); derr != nil {
-				a.log.Error("authkit: deliver reset token: %v", derr)
+				a.log.Error("deliver reset token failed", "err", derr)
 			}
-			a.emitAudit(ctx, AuditEvent{Type: AuditPasswordResetRequest, TenantID: u.TenantID, Actor: email, Subject: email, IP: clientIP(r), At: nowFn()})
+			a.emitAudit(ctx, AuditEvent{Type: AuditPasswordResetRequest, TenantID: u.TenantID, Actor: email, Subject: email, IP: a.clientIP(r), At: nowFn()})
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -155,79 +156,81 @@ func (a *Auth) ForgotPassword(w http.ResponseWriter, r *http.Request) {
 
 // ResetPassword completes self-service recovery: consume a valid reset token,
 // set the new password, and revoke all of the user's sessions. Mount on:
-// POST /auth/password/reset. Expects form: token, password.
+// POST /auth/password/reset. Fields: token, password.
 func (a *Auth) ResetPassword(w http.ResponseWriter, r *http.Request) {
-	if a.cfg.PasswordResetStore == nil {
-		http.Error(w, "password reset not enabled", http.StatusNotFound)
+	if a.cfg.Reset.Store == nil {
+		a.writeError(w, r, http.StatusNotFound, ErrCodeNotEnabled, "password reset not enabled")
 		return
 	}
+	parseBody(r)
 	token := strings.TrimSpace(r.FormValue("token"))
 	password := r.FormValue("password")
 	if err := a.validatePassword(password); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		a.writeError(w, r, http.StatusBadRequest, ErrCodePasswordPolicy, err.Error())
 		return
 	}
-	email, ok, err := a.cfg.PasswordResetStore.ConsumeResetToken(r.Context(), hashResetToken(token), ResetKindUser)
+	email, ok, err := a.cfg.Reset.Store.ConsumeResetToken(r.Context(), hashResetToken(token), ResetKindUser)
 	if err != nil {
-		a.log.Error("authkit: consume reset token: %v", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		a.log.Error("consume reset token failed", "err", err)
+		a.writeError(w, r, http.StatusInternalServerError, ErrCodeServerError, "internal error")
 		return
 	}
 	if !ok {
-		http.Error(w, "invalid or expired reset link", http.StatusBadRequest)
+		a.writeError(w, r, http.StatusBadRequest, ErrCodeInvalidRequest, "invalid or expired reset link")
 		return
 	}
 	u, err := a.cfg.UserStore.GetUserByEmail(r.Context(), email)
 	if err != nil {
-		http.Error(w, "invalid or expired reset link", http.StatusBadRequest)
+		a.writeError(w, r, http.StatusBadRequest, ErrCodeInvalidRequest, "invalid or expired reset link")
 		return
 	}
-	hashed, err := HashPassword(password)
+	hashed, err := a.hashPassword(password)
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		a.writeError(w, r, http.StatusInternalServerError, ErrCodeServerError, "internal error")
 		return
 	}
 	ctx := WithTenant(r.Context(), u.TenantID)
 	if err := a.cfg.UserStore.UpdatePassword(ctx, email, hashed); err != nil {
-		a.log.Error("authkit: update password: %v", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		a.log.Error("update password failed", "err", err)
+		a.writeError(w, r, http.StatusInternalServerError, ErrCodeServerError, "internal error")
 		return
 	}
 	// A credential change invalidates every existing session + trusted device +
-	// mobile refresh token, so a password reset cuts off the bearer axis too and
-	// an attacker who triggered the reset cannot keep a live refresh chain.
-	if a.cfg.SessionStore != nil {
-		_ = a.cfg.SessionStore.RevokeAllForUser(ctx, u.TenantID, email)
+	// refresh token, so a password reset cuts off the bearer axis too and an
+	// attacker who triggered the reset cannot keep a live refresh chain.
+	if a.cfg.Sessions.Store != nil {
+		_ = a.cfg.Sessions.Store.RevokeAllForUser(ctx, u.TenantID, email)
 	}
 	a.revokeTrustedDevices(ctx, u.TenantID, email)
-	if a.cfg.RefreshTokenStore != nil {
-		_ = a.cfg.RefreshTokenStore.RevokeAllForUser(ctx, u.TenantID, email)
+	if a.cfg.Tokens.RefreshStore != nil {
+		_ = a.cfg.Tokens.RefreshStore.RevokeAllForUser(ctx, u.TenantID, email)
 	}
-	a.emitAudit(ctx, AuditEvent{Type: AuditPasswordReset, TenantID: u.TenantID, Actor: email, Subject: email, IP: clientIP(r), At: nowFn()})
+	a.emitAudit(ctx, AuditEvent{Type: AuditPasswordReset, TenantID: u.TenantID, Actor: email, Subject: email, IP: a.clientIP(r), At: nowFn()})
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 // PlatformForgotPassword starts self-service recovery for a platform admin.
 // Same no-enumeration contract as ForgotPassword. Mount on:
-// POST /platform/password/forgot. Expects form: email.
+// POST /platform/password/forgot. Fields: email.
 func (a *Auth) PlatformForgotPassword(w http.ResponseWriter, r *http.Request) {
-	if a.cfg.PlatformAdminStore == nil || !a.resetEnabled() {
-		http.Error(w, "not enabled", http.StatusNotFound)
+	if a.cfg.Platform.Store == nil || !a.resetEnabled() {
+		a.writeError(w, r, http.StatusNotFound, ErrCodeNotEnabled, "not enabled")
 		return
 	}
+	parseBody(r)
 	email := strings.ToLower(strings.TrimSpace(r.FormValue("email")))
 	// Same rate-limit + no-enumeration reasoning as ForgotPassword.
-	tkey := "pwreset|platform|" + throttleKey(email, clientIP(r))
+	tkey := "pwreset|platform|" + throttleKey(email, a.clientIP(r))
 	if !a.throttleAllow(w, r, tkey) {
 		return
 	}
 	a.throttleFailure(r.Context(), tkey)
 	if validEmail.MatchString(email) {
-		if rec, err := a.cfg.PlatformAdminStore.GetPlatformAdmin(r.Context(), email); err == nil {
+		if rec, err := a.cfg.Platform.Store.GetPlatformAdmin(r.Context(), email); err == nil {
 			if _, derr := a.IssueResetToken(r.Context(), email, rec.Name, ResetKindPlatform); derr != nil {
-				a.log.Error("authkit: deliver platform reset token: %v", derr)
+				a.log.Error("deliver platform reset token failed", "err", derr)
 			}
-			a.emitAudit(r.Context(), AuditEvent{Type: AuditPasswordResetRequest, Actor: email, Subject: email, IP: clientIP(r), At: nowFn(), Meta: map[string]any{"platform": true}})
+			a.emitAudit(r.Context(), AuditEvent{Type: AuditPasswordResetRequest, Actor: email, Subject: email, IP: a.clientIP(r), At: nowFn(), Meta: map[string]any{"platform": true}})
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -236,42 +239,43 @@ func (a *Auth) PlatformForgotPassword(w http.ResponseWriter, r *http.Request) {
 // PlatformResetPassword completes a platform admin's recovery: consume the
 // token, set the new password, revoke platform sessions. 2FA enrollment is
 // untouched — the admin still passes TOTP at next login. Mount on:
-// POST /platform/password/reset. Expects form: token, password.
+// POST /platform/password/reset. Fields: token, password.
 func (a *Auth) PlatformResetPassword(w http.ResponseWriter, r *http.Request) {
-	if a.cfg.PlatformAdminStore == nil || a.cfg.PasswordResetStore == nil {
-		http.Error(w, "not enabled", http.StatusNotFound)
+	if a.cfg.Platform.Store == nil || a.cfg.Reset.Store == nil {
+		a.writeError(w, r, http.StatusNotFound, ErrCodeNotEnabled, "not enabled")
 		return
 	}
+	parseBody(r)
 	token := strings.TrimSpace(r.FormValue("token"))
 	password := r.FormValue("password")
 	if err := a.validatePassword(password); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		a.writeError(w, r, http.StatusBadRequest, ErrCodePasswordPolicy, err.Error())
 		return
 	}
-	email, ok, err := a.cfg.PasswordResetStore.ConsumeResetToken(r.Context(), hashResetToken(token), ResetKindPlatform)
+	email, ok, err := a.cfg.Reset.Store.ConsumeResetToken(r.Context(), hashResetToken(token), ResetKindPlatform)
 	if err != nil {
-		a.log.Error("authkit: consume platform reset token: %v", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		a.log.Error("consume platform reset token failed", "err", err)
+		a.writeError(w, r, http.StatusInternalServerError, ErrCodeServerError, "internal error")
 		return
 	}
 	if !ok {
-		http.Error(w, "invalid or expired reset link", http.StatusBadRequest)
+		a.writeError(w, r, http.StatusBadRequest, ErrCodeInvalidRequest, "invalid or expired reset link")
 		return
 	}
-	hashed, err := HashPassword(password)
+	hashed, err := a.hashPassword(password)
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		a.writeError(w, r, http.StatusInternalServerError, ErrCodeServerError, "internal error")
 		return
 	}
-	if err := a.cfg.PlatformAdminStore.UpdatePassword(r.Context(), email, hashed); err != nil {
-		a.log.Error("authkit: update platform password: %v", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+	if err := a.cfg.Platform.Store.UpdatePassword(r.Context(), email, hashed); err != nil {
+		a.log.Error("update platform password failed", "err", err)
+		a.writeError(w, r, http.StatusInternalServerError, ErrCodeServerError, "internal error")
 		return
 	}
 	// Platform sessions carry no tenant; revoke under the empty-tenant index.
-	if a.cfg.SessionStore != nil {
-		_ = a.cfg.SessionStore.RevokeAllForUser(r.Context(), "", email)
+	if a.cfg.Sessions.Store != nil {
+		_ = a.cfg.Sessions.Store.RevokeAllForUser(r.Context(), "", email)
 	}
-	a.emitAudit(r.Context(), AuditEvent{Type: AuditPasswordReset, Actor: email, Subject: email, IP: clientIP(r), At: nowFn(), Meta: map[string]any{"platform": true}})
+	a.emitAudit(r.Context(), AuditEvent{Type: AuditPasswordReset, Actor: email, Subject: email, IP: a.clientIP(r), At: nowFn(), Meta: map[string]any{"platform": true}})
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }

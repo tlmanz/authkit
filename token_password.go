@@ -3,11 +3,9 @@ package authkit
 import (
 	"net/http"
 	"strings"
-
-	"golang.org/x/crypto/bcrypt"
 )
 
-// Mobile native login: a password (+ optional TOTP) exchange that RETURNS the
+// Native password login: a password (+ optional TOTP) exchange that RETURNS the
 // access + refresh token pair, instead of the cookie session the web
 // /auth/login establishes. This is the first-party native path: the app
 // collects credentials in a native screen (no browser / PKCE round-trip) and
@@ -17,39 +15,40 @@ import (
 // IssuePasswordToken exchanges email+password for a token pair. When the user's
 // role requires 2FA, it instead returns a signed pending token that the client
 // completes via IssuePasswordToken2FA. Cookie-free: everything travels in the
-// JSON body so a mobile client needs no cookie jar.
+// request/response bodies so a native client needs no cookie jar.
 //
-// Mount on: POST /oauth/token/password. Form: email, password.
+// Mount on: POST /oauth/token/password. Fields: email, password.
 func (a *Auth) IssuePasswordToken(w http.ResponseWriter, r *http.Request) {
 	if !a.tokensEnabled() {
-		writeTokenError(w, http.StatusNotFound, "tokens_disabled", "tokens not enabled")
+		a.writeError(w, r, http.StatusNotFound, ErrCodeNotEnabled, "tokens not enabled")
 		return
 	}
 	if a.cfg.Mode == AuthModeOAuth {
-		writeTokenError(w, http.StatusNotFound, "unsupported_grant_type", "password login is not enabled")
+		a.writeError(w, r, http.StatusNotFound, ErrCodeUnsupportedGrant, "password login is not enabled")
 		return
 	}
+	parseBody(r)
 
 	email := strings.ToLower(strings.TrimSpace(r.FormValue("email")))
 	password := r.FormValue("password")
 
 	// Throttle per account+IP to blunt brute force / credential stuffing.
-	tkey := throttleKey(email, clientIP(r))
+	tkey := throttleKey(email, a.clientIP(r))
 	if !a.throttleAllow(w, r, tkey) {
 		return
 	}
 
 	storedUser, err := a.cfg.UserStore.GetUserByEmail(r.Context(), email)
 	if err != nil {
-		// Constant-time: run a dummy compare to prevent timing-based enumeration.
-		_ = bcrypt.CompareHashAndPassword(dummyHash, []byte(password))
+		// Constant-time: run a dummy verification to prevent timing-based enumeration.
+		a.dummyVerify(password)
 		a.throttleFailure(r.Context(), tkey)
-		writeTokenError(w, http.StatusUnauthorized, "invalid_grant", "invalid email or password")
+		a.writeError(w, r, http.StatusUnauthorized, ErrCodeInvalidGrant, "invalid email or password")
 		return
 	}
-	if !CheckPassword(storedUser.HashedPassword, password) {
+	if !a.checkPassword(storedUser.HashedPassword, password) {
 		a.throttleFailure(r.Context(), tkey)
-		writeTokenError(w, http.StatusUnauthorized, "invalid_grant", "invalid email or password")
+		a.writeError(w, r, http.StatusUnauthorized, ErrCodeInvalidGrant, "invalid email or password")
 		return
 	}
 	a.throttleReset(r.Context(), tkey)
@@ -58,8 +57,8 @@ func (a *Auth) IssuePasswordToken(w http.ResponseWriter, r *http.Request) {
 	role, _ := a.rbacProvider.RoleFor(ctx, email)
 
 	// A remembered device skips the TOTP step (password is still required).
-	// The mobile client presents the opaque trusted-device token in the body.
-	needs2FA := a.cfg.TOTPStore != nil && a.requires2FA(role)
+	// The native client presents the opaque trusted-device token in the body.
+	needs2FA := a.cfg.TwoFactor.Store != nil && a.requires2FA(role)
 	if needs2FA && a.trustedDeviceTokenValid(
 		ctx, storedUser.TenantID, email, r.FormValue("trusted_device_token")) {
 		needs2FA = false
@@ -68,10 +67,10 @@ func (a *Auth) IssuePasswordToken(w http.ResponseWriter, r *http.Request) {
 	// Second factor required: mint a signed pending token and tell the client
 	// whether to enroll (no confirmed secret yet) or verify.
 	if needs2FA {
-		_, confirmed, err := a.cfg.TOTPStore.Secret(ctx, storedUser.TenantID, email)
+		_, confirmed, err := a.cfg.TwoFactor.Store.Secret(ctx, storedUser.TenantID, email)
 		if err != nil {
-			a.log.Error("authkit: totp secret lookup failed: %v", err)
-			writeTokenError(w, http.StatusInternalServerError, "server_error", "internal error")
+			a.log.Error("totp secret lookup failed", "err", err)
+			a.writeError(w, r, http.StatusInternalServerError, ErrCodeServerError, "internal error")
 			return
 		}
 		action := "verify"
@@ -92,62 +91,63 @@ func (a *Auth) IssuePasswordToken(w http.ResponseWriter, r *http.Request) {
 		Provider: "password",
 		Role:     role,
 		TenantID: storedUser.TenantID,
-		BranchID: storedUser.BranchID,
+		Attrs:    cloneAttrs(storedUser.Attrs),
 	}
 	access, refresh, err := a.issueTokenPair(ctx, u)
 	if err != nil {
-		a.log.Error("authkit: token issue failed: %v", err)
-		writeTokenError(w, http.StatusInternalServerError, "server_error", "internal error")
+		a.log.Error("token issue failed", "err", err)
+		a.writeError(w, r, http.StatusInternalServerError, ErrCodeServerError, "internal error")
 		return
 	}
-	a.emitAudit(ctx, AuditEvent{Type: AuditLogin, TenantID: u.TenantID, Actor: email, Subject: email, IP: clientIP(r), At: nowFn(), Meta: map[string]any{"client": "mobile"}})
+	a.emitAudit(ctx, AuditEvent{Type: AuditLogin, TenantID: u.TenantID, Actor: email, Subject: email, IP: a.clientIP(r), At: nowFn(), Meta: map[string]any{"client": "native"}})
 	writeTokenResponse(w, access, refresh, a.accessTTL())
 }
 
-// IssuePasswordToken2FA completes a pending mobile login by validating a TOTP
+// IssuePasswordToken2FA completes a pending native login by validating a TOTP
 // (or recovery) code and returns the token pair. The pending token is the one
 // returned by IssuePasswordToken; it is carried in the request body, not a
 // cookie.
 //
-// Mount on: POST /oauth/token/2fa. Form: pending_token, code (or recovery_code).
+// Mount on: POST /oauth/token/2fa. Fields: pending_token, code (or recovery_code).
 func (a *Auth) IssuePasswordToken2FA(w http.ResponseWriter, r *http.Request) {
 	if !a.tokensEnabled() {
-		writeTokenError(w, http.StatusNotFound, "tokens_disabled", "tokens not enabled")
+		a.writeError(w, r, http.StatusNotFound, ErrCodeNotEnabled, "tokens not enabled")
 		return
 	}
-	if a.cfg.TOTPStore == nil {
-		writeTokenError(w, http.StatusNotFound, "twofa_disabled", "2fa not enabled")
+	if a.cfg.TwoFactor.Store == nil {
+		a.writeError(w, r, http.StatusNotFound, ErrCodeNotEnabled, "2fa not enabled")
 		return
 	}
+	parseBody(r)
 
 	email, ok := a.parsePendingToken(r.FormValue("pending_token"))
 	if !ok {
-		writeTokenError(w, http.StatusUnauthorized, "invalid_grant", "invalid or expired 2fa challenge")
+		a.writeError(w, r, http.StatusUnauthorized, ErrCodeInvalidGrant, "invalid or expired 2fa challenge")
 		return
 	}
 
-	tkey := throttleKey(email, clientIP(r))
+	tkey := throttleKey(email, a.clientIP(r))
 	if !a.throttleAllow(w, r, tkey) {
 		return
 	}
 
 	storedUser, err := a.cfg.UserStore.GetUserByEmail(r.Context(), email)
 	if err != nil {
-		writeTokenError(w, http.StatusUnauthorized, "invalid_grant", "invalid challenge")
+		a.writeError(w, r, http.StatusUnauthorized, ErrCodeInvalidGrant, "invalid challenge")
 		return
 	}
 	ctx := WithTenant(r.Context(), storedUser.TenantID)
 
 	if !a.validate2FA(ctx, storedUser.TenantID, email, r) {
 		a.throttleFailure(ctx, tkey)
-		writeTokenError(w, http.StatusUnauthorized, "invalid_grant", "invalid code")
+		a.writeError(w, r, http.StatusUnauthorized, ErrCodeInvalidGrant, "invalid code")
 		return
 	}
 	// First successful verification confirms a pending enrollment (idempotent
 	// for an already-confirmed secret), so future logins go straight to verify.
-	if err := a.cfg.TOTPStore.Confirm(ctx, storedUser.TenantID, email); err != nil {
-		a.log.Error("authkit: totp confirm failed: %v", err)
-		writeTokenError(w, http.StatusInternalServerError, "server_error", "internal error")
+	if err := a.cfg.TwoFactor.Store.Confirm(ctx, storedUser.TenantID, email); err != nil {
+		a.log.Error("totp confirm failed", "err", err)
+		a.writeError(w, r, http.StatusInternalServerError, ErrCodeServerError, "internal error")
 		return
 	}
 	a.throttleReset(ctx, tkey)
@@ -159,12 +159,12 @@ func (a *Auth) IssuePasswordToken2FA(w http.ResponseWriter, r *http.Request) {
 		Provider: "password",
 		Role:     role,
 		TenantID: storedUser.TenantID,
-		BranchID: storedUser.BranchID,
+		Attrs:    cloneAttrs(storedUser.Attrs),
 	}
 	access, refresh, err := a.issueTokenPair(ctx, u)
 	if err != nil {
-		a.log.Error("authkit: token issue failed: %v", err)
-		writeTokenError(w, http.StatusInternalServerError, "server_error", "internal error")
+		a.log.Error("token issue failed", "err", err)
+		a.writeError(w, r, http.StatusInternalServerError, ErrCodeServerError, "internal error")
 		return
 	}
 
@@ -175,7 +175,7 @@ func (a *Auth) IssuePasswordToken2FA(w http.ResponseWriter, r *http.Request) {
 		trusted = a.mintTrustedDeviceToken(ctx, storedUser.TenantID, email)
 	}
 
-	a.emitAudit(ctx, AuditEvent{Type: AuditLogin, TenantID: u.TenantID, Actor: email, Subject: email, IP: clientIP(r), At: nowFn(), Meta: map[string]any{"client": "mobile", "twofa": true, "remembered": trusted != ""}})
+	a.emitAudit(ctx, AuditEvent{Type: AuditLogin, TenantID: u.TenantID, Actor: email, Subject: email, IP: a.clientIP(r), At: nowFn(), Meta: map[string]any{"client": "native", "twofa": true, "remembered": trusted != ""}})
 
 	resp := map[string]any{
 		"access_token":  access,

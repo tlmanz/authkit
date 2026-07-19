@@ -11,7 +11,8 @@ import (
 
 // LoginThrottler rate-limits authentication attempts to blunt credential
 // stuffing and brute force. The host implements it (e.g. backed by Redis);
-// authkit calls it around the password login flow. Keys are per account+IP.
+// authkit calls it around the password login, 2FA, and password-reset flows.
+// Keys are per account+IP.
 type LoginThrottler interface {
 	// Allow reports whether an attempt for key may proceed. When locked out, ok
 	// is false and retryAfter is the remaining lockout duration.
@@ -27,10 +28,19 @@ func throttleKey(email, ip string) string {
 	return strings.ToLower(strings.TrimSpace(email)) + "|" + ip
 }
 
-// clientIP returns the request's source IP (host portion of RemoteAddr). It
-// deliberately does NOT trust X-Forwarded-For — behind a proxy the host app
-// should set RemoteAddr from a vetted header before authkit sees the request.
-func clientIP(r *http.Request) string {
+// clientIP resolves the request's source IP through the configured hook, or
+// falls back to the host portion of RemoteAddr. The default deliberately does
+// NOT trust X-Forwarded-For — behind a reverse proxy, configure
+// Config.ClientIP with a function that reads your vetted header.
+func (a *Auth) clientIP(r *http.Request) string {
+	if a.cfg.ClientIP != nil {
+		return a.cfg.ClientIP(r)
+	}
+	return defaultClientIP(r)
+}
+
+// defaultClientIP returns the host portion of RemoteAddr.
+func defaultClientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		return r.RemoteAddr
@@ -50,7 +60,7 @@ func (a *Auth) throttleAllow(w http.ResponseWriter, r *http.Request, key string)
 	}
 	secs := max(int(retryAfter.Seconds()), 1)
 	w.Header().Set("Retry-After", strconv.Itoa(secs))
-	http.Error(w, "too many attempts — try again later", http.StatusTooManyRequests)
+	a.writeError(w, r, http.StatusTooManyRequests, ErrCodeRateLimited, "too many attempts — try again later")
 	return false
 }
 
