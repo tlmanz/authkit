@@ -41,6 +41,12 @@ type PasswordUser struct {
 	// determines the tenant). They are copied onto the authenticated User.
 	TenantID string
 	BranchID string
+
+	// MustChangePassword is set when the credential is a temporary/onboarding
+	// one the user must replace before doing anything else. When true, Login
+	// stops before 2FA and asks the SPA to collect a new password (see
+	// ChangeFirstPassword); the store clears it on the next UpdatePassword.
+	MustChangePassword bool
 }
 
 // Sentinel errors for UserStore implementations.

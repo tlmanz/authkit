@@ -124,6 +124,17 @@ func (a *Auth) Login(w http.ResponseWriter, r *http.Request) {
 	ctx := WithTenant(r.Context(), storedUser.TenantID)
 	role, permissions := a.rbacProvider.RoleFor(ctx, email)
 
+	// First-login gate: a user flagged must-change-password sets their own
+	// password before anything else — even 2FA (the onboarding order is
+	// Set password → Enroll 2FA → Recovery). Reuse the short-lived pending token
+	// (it proves the password was just verified) so the SPA can post a new one to
+	// /auth/password/first-change with no full session yet.
+	if storedUser.MustChangePassword {
+		a.setPendingCookie(w, a.issuePendingToken(email))
+		writeJSON(w, http.StatusOK, map[string]string{"status": "password_change_required"})
+		return
+	}
+
 	// Two-step auth: when the role requires 2FA, stop here and start the TOTP
 	// challenge instead of minting a session — UNLESS this device was previously
 	// trusted ("remember this device"), in which case skip straight to a session.
@@ -177,4 +188,66 @@ func (a *Auth) establishLoginSession(ctx context.Context, w http.ResponseWriter,
 		permissions: permissions,
 	}
 	return a.saveSession(ctx, w, r, u)
+}
+
+// ChangeFirstPassword replaces the password for a user in the first-login
+// "must change password" pending state — the pending cookie set by Login proves
+// the old (temporary) password was just verified. On success it clears the
+// must-change flag (via UpdatePassword) and CONTINUES the login: it starts the
+// TOTP step when the role needs 2FA, otherwise it mints the session directly. So
+// the order is always Set password → 2FA, matching onboarding.
+// Mount on: POST /auth/password/first-change. Expects form: password.
+func (a *Auth) ChangeFirstPassword(w http.ResponseWriter, r *http.Request) {
+	if a.cfg.Mode == AuthModeOAuth {
+		http.Error(w, "password login is not enabled", http.StatusNotFound)
+		return
+	}
+	email, ok := a.readPendingToken(r)
+	if !ok {
+		http.Error(w, "no pending challenge", http.StatusUnauthorized)
+		return
+	}
+	newPassword := r.FormValue("password")
+	if err := a.validatePassword(newPassword); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	storedUser, err := a.cfg.UserStore.GetUserByEmail(r.Context(), email)
+	if err != nil {
+		http.Error(w, "invalid challenge", http.StatusUnauthorized)
+		return
+	}
+	ctx := WithTenant(r.Context(), storedUser.TenantID)
+	hashed, err := HashPassword(newPassword)
+	if err != nil {
+		a.log.Error("authkit: hash password: %v", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	// UpdatePassword also clears the must-change flag (the store owns that).
+	if err := a.cfg.UserStore.UpdatePassword(ctx, email, hashed); err != nil {
+		a.log.Error("authkit: first-password update: %v", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	storedUser.HashedPassword = hashed
+	storedUser.MustChangePassword = false
+	a.emitAudit(ctx, AuditEvent{Type: AuditPasswordChange, TenantID: storedUser.TenantID, Actor: email, Subject: email, IP: clientIP(r), At: nowFn(), Meta: map[string]any{"first_login": true}})
+
+	// Continue the login. beginTwoFactor rotates the pending cookie for the TOTP
+	// step; the non-2FA path clears it and establishes the session.
+	role, _ := a.rbacProvider.RoleFor(ctx, email)
+	if a.cfg.TOTPStore != nil && a.requires2FA(role) {
+		a.beginTwoFactor(ctx, w, email)
+		return
+	}
+	a.clearPendingCookie(w)
+	if err := a.establishLoginSession(ctx, w, r, email, storedUser); err != nil {
+		a.log.Error("authkit: session error after first-password change: %v", err)
+		http.Error(w, "session error", http.StatusInternalServerError)
+		return
+	}
+	a.emitAudit(ctx, AuditEvent{Type: AuditLogin, TenantID: storedUser.TenantID, Actor: email, Subject: email, IP: clientIP(r), At: nowFn()})
+	http.Redirect(w, r, a.cfg.AfterLoginURL, http.StatusSeeOther)
 }

@@ -196,6 +196,23 @@ func (a *Auth) PlatformLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A previously trusted device ("remember this device") skips the TOTP step, but
+	// only once 2FA is actually enrolled — a not-yet-confirmed admin must still
+	// enroll. The password was already required, and the trusted token is opaque,
+	// server-side, revocable and expiring. Platform admins have no tenant, so the
+	// trusted-device key uses an empty tenant.
+	if rec.TOTPConfirmed && a.trustedDeviceValid(r, "", email) {
+		a.throttleReset(r.Context(), tkey)
+		if err := a.establishPlatformSession(r.Context(), w, r, rec); err != nil {
+			a.log.Error("authkit: platform session error (trusted device): %v", err)
+			http.Error(w, "session error", http.StatusInternalServerError)
+			return
+		}
+		a.emitAudit(r.Context(), AuditEvent{Type: AuditLogin, Actor: email, IP: clientIP(r), At: nowFn(), Meta: map[string]any{"platform": true, "result": "ok", "trusted_device": true}})
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+		return
+	}
+
 	// Password correct → arm the TOTP step. A console-created admin who has not yet
 	// confirmed 2FA enrolls now (pending→confirm); everyone else verifies. Throttle
 	// is reset only on full success.
@@ -249,6 +266,10 @@ func (a *Auth) PlatformVerify2FA(w http.ResponseWriter, r *http.Request) {
 	}
 	a.throttleReset(r.Context(), tkey)
 	a.clearPlatformPendingCookie(w)
+
+	// Honor "remember this device": mint + set a trusted-device cookie so the next
+	// login on this browser skips 2FA (best-effort; empty tenant for platform).
+	a.rememberDevice(r.Context(), w, r, "", email)
 
 	if err := a.establishPlatformSession(r.Context(), w, r, rec); err != nil {
 		a.log.Error("authkit: platform session error: %v", err)
