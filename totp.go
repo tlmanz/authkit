@@ -68,6 +68,37 @@ func (a *Auth) requires2FA(role string) bool {
 	return slices.Contains(a.cfg.TwoFactor.RequireForRoles, role)
 }
 
+// Second-factor steps a sign-in can stop at (the "action" a client is told).
+const (
+	twoFactorVerify = "verify" // enter a code from a confirmed authenticator
+	twoFactorEnroll = "enroll" // set one up first; the role requires it
+)
+
+// loginTwoFactor decides the second-factor step a sign-in must take, or "" for
+// none. A confirmed authenticator means "verify" whatever the role: 2FA the
+// user turned on themselves is enforced too, where only RequireForRoles used to
+// be consulted and enabling 2FA from an account page protected nothing at
+// sign-in. A role that requires 2FA with nothing confirmed means "enroll"; a
+// pending, never-confirmed secret otherwise counts for nothing, since nothing
+// can produce a code for it. A lookup error is returned so the caller fails
+// closed rather than treating "unknown" as "off".
+func (a *Auth) loginTwoFactor(ctx context.Context, tenantID, email, role string) (string, error) {
+	if a.cfg.TwoFactor.Store == nil {
+		return "", nil
+	}
+	_, confirmed, err := a.cfg.TwoFactor.Store.Secret(ctx, tenantID, email)
+	switch {
+	case err != nil:
+		return "", err
+	case confirmed:
+		return twoFactorVerify, nil
+	case a.requires2FA(role):
+		return twoFactorEnroll, nil
+	default:
+		return "", nil
+	}
+}
+
 func (a *Auth) twofaCookieName() string { return a.cookieName("2fa_pending") }
 
 type pendingClaims struct {
@@ -135,23 +166,11 @@ func (a *Auth) clearPendingCookie(w http.ResponseWriter) {
 	})
 }
 
-// beginTwoFactor is invoked after a successful primary auth when the user's role
-// requires 2FA. It sets the pending cookie and tells the client whether to
-// enroll or verify. It does NOT mint a full session.
-func (a *Auth) beginTwoFactor(ctx context.Context, w http.ResponseWriter, email string) {
-	_, confirmed, err := a.cfg.TwoFactor.Store.Secret(ctx, tenantFromCtxOrEmpty(ctx), email)
-	if err != nil {
-		a.log.Error("totp secret lookup failed", "err", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": ErrCodeServerError, "error_description": "internal error"})
-		return
-	}
+// beginTwoFactor is invoked after a successful primary auth when loginTwoFactor
+// says a second factor is due. It sets the pending cookie and tells the client
+// the step (action) to take. It does NOT mint a full session.
+func (a *Auth) beginTwoFactor(w http.ResponseWriter, email, action string) {
 	a.setPendingCookie(w, a.issuePendingToken(email))
-	// Enroll unless 2FA is fully confirmed: no secret yet, OR a pending one the
-	// user provisioned but never verified (so they aren't stranded at verify).
-	action := "verify"
-	if !confirmed {
-		action = "enroll"
-	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "2fa_required", "action": action})
 }
 
@@ -343,10 +362,4 @@ func hashRecoveryCode(code string) string {
 	norm := strings.ToUpper(strings.NewReplacer("-", "", " ", "").Replace(strings.TrimSpace(code)))
 	sum := sha256.Sum256([]byte(norm))
 	return hex.EncodeToString(sum[:])
-}
-
-// tenantFromCtxOrEmpty returns the tenant on ctx (or "").
-func tenantFromCtxOrEmpty(ctx context.Context) string {
-	id, _ := TenantIDFromCtx(ctx)
-	return id
 }

@@ -2,6 +2,9 @@ package authkit
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -37,29 +40,171 @@ func (a *Auth) trustedDeviceTTL() time.Duration {
 
 func (a *Auth) trustedDeviceCookieName() string { return a.cookieName("trusted") }
 
+// The trusted-device cookie holds one entry per remembered account, because a
+// shared counter PC is normal: several people who must pass 2FA each tick
+// "remember", and one of them doing so must not make the browser forget the
+// others (a single-token cookie did exactly that). There is no cap on how many
+// accounts a browser remembers.
+//
+// maxTrustedCookieValue is not such a cap; it is the browser's. A cookie over
+// ~4096 bytes (name, value and attributes together) is silently dropped, which
+// would forget EVERY remembered account at once. Only when the value would not
+// fit are entries dropped, oldest first. At ~80 bytes per encoded entry that is
+// around fifty accounts on one browser. A cookie longer than this was never
+// issued here, and is ignored rather than spent on store lookups.
+const maxTrustedCookieValue = 3800
+
+// trustedEntry is one remembered account in the trusted-device cookie: the
+// store's opaque token, labelled with trustedAccountKey for the account it
+// belongs to. The label is what lets a login look up its own token only, and
+// lets "log out everywhere" drop its own without asking the store. An empty
+// account marks the single raw token a v2.0.0 cookie held, whose owner is
+// unknown.
+type trustedEntry struct{ account, token string }
+
+// trustedAccountKey labels (tenantID, email) in the cookie. It is an HMAC under
+// the session secret, so the cookie names nobody and a label cannot be made for
+// someone else's account. Twelve characters (72 bits) keeps a browser's
+// accounts apart. base64url never contains '.', the entry separator.
+func (a *Auth) trustedAccountKey(tenantID, email string) string {
+	// Length-prefixed: '|' is legal in an email, so a bare join would let two
+	// different (tenant, email) pairs share a label.
+	return a.sign(fmt.Sprintf("trusted|%d|%s|%s", len(tenantID), tenantID, email))[:12]
+}
+
+// trustedEntries returns the entries this browser's cookie holds, newest first.
+// The cookie carries base64url(JSON array of "account.token"). A v2.0.0 cookie
+// carries one raw token, read as a single unlabelled entry so browsers
+// remembered before the upgrade keep working.
+func (a *Auth) trustedEntries(r *http.Request) []trustedEntry {
+	c, err := r.Cookie(a.trustedDeviceCookieName())
+	if err != nil || c.Value == "" || len(c.Value) > maxTrustedCookieValue {
+		return nil
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(c.Value)
+	var list []string
+	if err != nil || json.Unmarshal(raw, &list) != nil {
+		return []trustedEntry{{token: c.Value}}
+	}
+	entries := make([]trustedEntry, 0, len(list))
+	for _, s := range list {
+		if account, token, ok := strings.Cut(s, "."); ok && token != "" {
+			entries = append(entries, trustedEntry{account: account, token: token})
+		}
+	}
+	return entries
+}
+
+// encodeTrustedEntries encodes entries (newest first) as the cookie value,
+// keeping as many of the newest as fit in maxTrustedCookieValue. The JSON
+// wrapping keeps any token a store issues safe, whatever characters it uses.
+func encodeTrustedEntries(entries []trustedEntry) string {
+	list := make([]string, 0, len(entries))
+	jsonLen := 1 // the opening '['; each item then adds its own length + ',' or ']'
+	for _, e := range entries {
+		item := e.account + "." + e.token
+		quoted, _ := json.Marshal(item)
+		if base64.RawURLEncoding.EncodedLen(jsonLen+len(quoted)+1) > maxTrustedCookieValue {
+			break
+		}
+		list = append(list, item)
+		jsonLen += len(quoted) + 1
+	}
+	if len(list) == 0 {
+		return ""
+	}
+	raw, _ := json.Marshal(list)
+	return base64.RawURLEncoding.EncodeToString(raw)
+}
+
+// setTrustedEntries writes entries as this browser's trusted-device cookie, or
+// expires the cookie when none are left.
+func (a *Auth) setTrustedEntries(w http.ResponseWriter, entries []trustedEntry) {
+	value := encodeTrustedEntries(entries)
+	if value == "" {
+		a.clearTrustedDeviceCookie(w)
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     a.trustedDeviceCookieName(),
+		Value:    value,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   a.cfg.SecureCookie,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   int(a.trustedDeviceTTL() / time.Second),
+	})
+}
+
+// tokenTrustedFor reports whether token is a live trust for (tenantID, email).
+func (a *Auth) tokenTrustedFor(ctx context.Context, tenantID, email, token string) bool {
+	ok, err := a.cfg.TwoFactor.TrustedDevices.IsTrusted(WithTenant(ctx, tenantID), tenantID, email, token)
+	return err == nil && ok
+}
+
 // trustedDeviceValid reports whether the request carries a live trusted-device
-// cookie for (tenantID, email), so the login can skip the TOTP step.
+// token for (tenantID, email), so the login can skip the TOTP step. It asks the
+// store about at most two tokens, the account's own entry and an unlabelled
+// v2.0.0 one, however many other accounts the cookie holds.
 func (a *Auth) trustedDeviceValid(r *http.Request, tenantID, email string) bool {
 	if a.cfg.TwoFactor.TrustedDevices == nil {
 		return false
 	}
-	c, err := r.Cookie(a.trustedDeviceCookieName())
-	if err != nil || c.Value == "" {
-		return false
+	key := a.trustedAccountKey(tenantID, email)
+	var own, legacy string
+	for _, e := range a.trustedEntries(r) {
+		switch {
+		case e.account == key && own == "":
+			own = e.token
+		case e.account == "" && legacy == "":
+			legacy = e.token
+		}
 	}
-	ok, err := a.cfg.TwoFactor.TrustedDevices.IsTrusted(WithTenant(r.Context(), tenantID), tenantID, email, c.Value)
-	return err == nil && ok
+	for _, token := range []string{own, legacy} {
+		if token != "" && a.tokenTrustedFor(r.Context(), tenantID, email, token) {
+			return true
+		}
+	}
+	return false
+}
+
+// trustedEntriesExcept returns this browser's entries that do NOT belong to
+// (tenantID, email). The account's own entries are dropped by label, live or
+// not, so a stale token of its own never lingers. An unlabelled v2.0.0 entry
+// can only be told apart by asking the store, so call this before revoking the
+// account's trust; it is kept only when the store says it is someone else's, and
+// an error drops it, since it may be this account's.
+func (a *Auth) trustedEntriesExcept(ctx context.Context, r *http.Request, tenantID, email string) []trustedEntry {
+	if a.cfg.TwoFactor.TrustedDevices == nil {
+		return nil
+	}
+	key := a.trustedAccountKey(tenantID, email)
+	var keep []trustedEntry
+	seenLegacy := false
+	for _, e := range a.trustedEntries(r) {
+		switch {
+		case e.account == key:
+		case e.account == "":
+			if seenLegacy {
+				continue // a v2.0.0 cookie held one; more were never issued
+			}
+			seenLegacy = true
+			ok, err := a.cfg.TwoFactor.TrustedDevices.IsTrusted(WithTenant(ctx, tenantID), tenantID, email, e.token)
+			if err == nil && !ok {
+				keep = append(keep, e)
+			}
+		default:
+			keep = append(keep, e)
+		}
+	}
+	return keep
 }
 
 // trustedDeviceTokenValid is the cookie-free variant used by the native token
 // flow: the client presents the opaque trusted-device token in the request body
 // instead of a cookie. Reports whether it is a live trust for (tenantID, email).
 func (a *Auth) trustedDeviceTokenValid(ctx context.Context, tenantID, email, token string) bool {
-	if a.cfg.TwoFactor.TrustedDevices == nil || token == "" {
-		return false
-	}
-	ok, err := a.cfg.TwoFactor.TrustedDevices.IsTrusted(WithTenant(ctx, tenantID), tenantID, email, token)
-	return err == nil && ok
+	return a.cfg.TwoFactor.TrustedDevices != nil && token != "" && a.tokenTrustedFor(ctx, tenantID, email, token)
 }
 
 // mintTrustedDeviceToken records a trusted device and returns the opaque token
@@ -87,9 +232,12 @@ func formTrue(v string) bool {
 	}
 }
 
-// rememberDevice mints + sets a trusted-device cookie when the client asked to
-// (the "trust this device" checkbox: a truthy `remember` value) and a store
-// is configured. Best-effort: a failure to remember never blocks the login.
+// rememberDevice mints a trusted-device token when the client asked to (the
+// "trust this device" checkbox: a truthy `remember` value) and a store is
+// configured, and adds it to this browser's cookie. Any earlier entry of the
+// same account leaves the cookie (its token stays valid in the store until it
+// expires, but only this browser ever held it); other accounts' entries are
+// kept. Best-effort: a failure to remember never blocks the login.
 func (a *Auth) rememberDevice(ctx context.Context, w http.ResponseWriter, r *http.Request, tenantID, email string) {
 	if a.cfg.TwoFactor.TrustedDevices == nil {
 		return
@@ -102,15 +250,8 @@ func (a *Auth) rememberDevice(ctx context.Context, w http.ResponseWriter, r *htt
 		a.log.Error("trust device failed", "err", err)
 		return
 	}
-	http.SetCookie(w, &http.Cookie{
-		Name:     a.trustedDeviceCookieName(),
-		Value:    token,
-		Path:     "/",
-		HttpOnly: true,
-		Secure:   a.cfg.SecureCookie,
-		SameSite: http.SameSiteLaxMode,
-		MaxAge:   int(a.trustedDeviceTTL() / time.Second),
-	})
+	own := trustedEntry{account: a.trustedAccountKey(tenantID, email), token: token}
+	a.setTrustedEntries(w, append([]trustedEntry{own}, a.trustedEntriesExcept(ctx, r, tenantID, email)...))
 }
 
 // revokeTrustedDevices drops a user's trusted devices (nil-safe). Called wherever

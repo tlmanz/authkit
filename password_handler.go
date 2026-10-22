@@ -135,12 +135,20 @@ func (a *Auth) Login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Two-step auth: when the role requires 2FA, stop here and start the TOTP
-	// challenge instead of minting a session — UNLESS this device was previously
-	// trusted ("remember this device"), in which case skip straight to a session.
-	// The password was still required; the trusted token is revocable + expiring.
-	if a.cfg.TwoFactor.Store != nil && a.requires2FA(role) {
-		if a.trustedDeviceValid(r, storedUser.TenantID, email) {
+	// Two-step auth: when the role requires 2FA or the user turned it on, stop
+	// here and start the TOTP challenge instead of minting a session — UNLESS
+	// this device was previously trusted ("remember this device"), in which case
+	// skip straight to a session. The password was still required; the trusted
+	// token is revocable + expiring. Only a confirmed authenticator can be
+	// skipped: after a 2FA reset the user must enroll again, remembered or not.
+	action, err := a.loginTwoFactor(ctx, storedUser.TenantID, email, role)
+	if err != nil {
+		a.log.Error("totp secret lookup failed", "err", err)
+		a.writeError(w, r, http.StatusInternalServerError, ErrCodeServerError, "internal error")
+		return
+	}
+	if action != "" {
+		if action == twoFactorVerify && a.trustedDeviceValid(r, storedUser.TenantID, email) {
 			if err := a.establishLoginSession(ctx, w, r, email, storedUser); err != nil {
 				a.log.Error("session error during trusted-device login", "err", err)
 				a.writeError(w, r, http.StatusInternalServerError, ErrCodeServerError, "session error")
@@ -150,7 +158,7 @@ func (a *Auth) Login(w http.ResponseWriter, r *http.Request) {
 			http.Redirect(w, r, a.cfg.AfterLoginURL, http.StatusSeeOther)
 			return
 		}
-		a.beginTwoFactor(ctx, w, email)
+		a.beginTwoFactor(w, email, action)
 		return
 	}
 
@@ -239,8 +247,14 @@ func (a *Auth) ChangeFirstPassword(w http.ResponseWriter, r *http.Request) {
 	// Continue the login. beginTwoFactor rotates the pending cookie for the TOTP
 	// step; the non-2FA path clears it and establishes the session.
 	role, _ := a.rbacProvider.RoleFor(ctx, email)
-	if a.cfg.TwoFactor.Store != nil && a.requires2FA(role) {
-		a.beginTwoFactor(ctx, w, email)
+	action, err := a.loginTwoFactor(ctx, storedUser.TenantID, email, role)
+	if err != nil {
+		a.log.Error("totp secret lookup failed", "err", err)
+		a.writeError(w, r, http.StatusInternalServerError, ErrCodeServerError, "internal error")
+		return
+	}
+	if action != "" {
+		a.beginTwoFactor(w, email, action)
 		return
 	}
 	a.clearPendingCookie(w)

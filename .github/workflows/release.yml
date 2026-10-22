@@ -1,0 +1,148 @@
+name: Release
+
+# Publishes a GitHub release when a version tag is pushed. This repo holds two
+# Go modules, each with its own tag family:
+#
+#   v2.0.1             -> github.com/tlmanz/authkit/v2            (CHANGELOG.md)
+#   redisstore/v2.0.1  -> github.com/tlmanz/authkit/redisstore/v2 (redisstore/CHANGELOG.md)
+#
+# The tag is the release: Go consumers fetch the version straight from it, so
+# this workflow re-verifies the tagged code, refuses to publish without written
+# release notes, and then makes the version fetchable from the module proxy.
+# See RELEASING.md.
+
+on:
+  push:
+    tags:
+      - "v*"
+      - "redisstore/v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Test each module the way a consumer gets it: against the versions its own
+  # go.mod requires, not against the sibling checkout go.work points at.
+  GOWORK: "off"
+
+jobs:
+  release:
+    name: Verify and publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the tag
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Resolve the module this tag releases
+        id: mod
+        run: |
+          tag="$GITHUB_REF_NAME"
+          case "$tag" in
+            redisstore/v*) dir=redisstore; version="${tag#redisstore/}"; family='redisstore/v*' ;;
+            v*)            dir=.;          version="$tag";               family='v*' ;;
+            *) echo "::error::Unrecognised tag '$tag'."; exit 1 ;;
+          esac
+          if ! [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::'$tag' is not a semantic version tag (vMAJOR.MINOR.PATCH[-PRERELEASE])."
+            exit 1
+          fi
+
+          module=$(cd "$dir" && go list -m)
+          # A /vN module path only accepts vN.x.y tags; any other major is a tag
+          # the Go toolchain will never resolve, so publishing it would be a lie.
+          major="${version%%.*}"
+          suffix=$(grep -oE '/v[0-9]+$' <<<"$module" | tr -d / || true)
+          if [ -n "$suffix" ] && [ "$major" != "$suffix" ]; then
+            echo "::error::$module only accepts $suffix.x.y tags, not $version."
+            exit 1
+          fi
+          if [ -z "$suffix" ] && [ "$major" != v0 ] && [ "$major" != v1 ]; then
+            echo "::error::$module has no /$major suffix, so it cannot be released as $version."
+            exit 1
+          fi
+
+          # The previous release of the SAME module, so the generated change list
+          # does not span the other module's tags.
+          prev=$(git tag --list "$family" --sort=-v:refname | grep -vxF "$tag" | head -n1 || true)
+
+          {
+            echo "dir=$dir"
+            echo "version=$version"
+            echo "module=$module"
+            echo "prev=$prev"
+          } >> "$GITHUB_OUTPUT"
+          echo "Releasing $module $version from $dir (previous: ${prev:-none})"
+
+      - name: gofmt
+        working-directory: ${{ steps.mod.outputs.dir }}
+        run: test -z "$(gofmt -l .)"
+
+      - name: Vet
+        working-directory: ${{ steps.mod.outputs.dir }}
+        run: go vet ./...
+
+      - name: Test (race)
+        working-directory: ${{ steps.mod.outputs.dir }}
+        run: go test -race ./...
+
+      - name: Release notes from the changelog
+        working-directory: ${{ steps.mod.outputs.dir }}
+        run: |
+          version='${{ steps.mod.outputs.version }}'
+          # The section runs from "## [vX.Y.Z]" to the next "## [" heading.
+          awk -v head="## [$version]" '
+            index($0, head) == 1 { found = 1; next }
+            found && /^## \[/    { exit }
+            found                { print }
+          ' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+          if ! grep -q '[^[:space:]]' "$RUNNER_TEMP/notes.md"; then
+            echo "::error::CHANGELOG.md has no notes for $version. Add a '## [$version] - MM/DD/YY' section, then delete and re-push the tag."
+            exit 1
+          fi
+          cat "$RUNNER_TEMP/notes.md"
+
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          version='${{ steps.mod.outputs.version }}'
+          prev='${{ steps.mod.outputs.prev }}'
+          title="$tag"
+          [ "${{ steps.mod.outputs.dir }}" = redisstore ] && title="redisstore $version"
+
+          # The written notes come first; GitHub appends the generated list of
+          # merged changes since the previous tag of this module.
+          args=(--verify-tag --title "$title" --notes-file "$RUNNER_TEMP/notes.md" --generate-notes)
+          [ -n "$prev" ] && args+=(--notes-start-tag "$prev")
+          if [[ "$version" == *-* ]]; then
+            args+=(--prerelease --latest=false)
+          elif [ "${{ steps.mod.outputs.dir }}" = redisstore ]; then
+            # "Latest" (and the README badge) tracks the core module.
+            args+=(--latest=false)
+          fi
+          gh release create "$tag" "${args[@]}"
+
+      - name: Make the version fetchable from the Go module proxy
+        working-directory: ${{ runner.temp }}
+        run: |
+          target='${{ steps.mod.outputs.module }}@${{ steps.mod.outputs.version }}'
+          for attempt in 1 2 3 4 5; do
+            if GOPROXY=https://proxy.golang.org go list -m "$target"; then
+              exit 0
+            fi
+            echo "Proxy has not picked up $target yet (attempt $attempt); retrying."
+            sleep 15
+          done
+          echo "::warning::proxy.golang.org did not return $target. The release is published; the first 'go get' will fetch it."

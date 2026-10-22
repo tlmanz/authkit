@@ -56,27 +56,23 @@ func (a *Auth) IssuePasswordToken(w http.ResponseWriter, r *http.Request) {
 	ctx := WithTenant(r.Context(), storedUser.TenantID)
 	role, _ := a.rbacProvider.RoleFor(ctx, email)
 
-	// A remembered device skips the TOTP step (password is still required).
-	// The native client presents the opaque trusted-device token in the body.
-	needs2FA := a.cfg.TwoFactor.Store != nil && a.requires2FA(role)
-	if needs2FA && a.trustedDeviceTokenValid(
+	// A remembered device skips the TOTP step (password is still required), but
+	// only for a confirmed authenticator: after a 2FA reset the user must enroll
+	// again. The native client presents the opaque trusted-device token in the body.
+	action, err := a.loginTwoFactor(ctx, storedUser.TenantID, email, role)
+	if err != nil {
+		a.log.Error("totp secret lookup failed", "err", err)
+		a.writeError(w, r, http.StatusInternalServerError, ErrCodeServerError, "internal error")
+		return
+	}
+	if action == twoFactorVerify && a.trustedDeviceTokenValid(
 		ctx, storedUser.TenantID, email, r.FormValue("trusted_device_token")) {
-		needs2FA = false
+		action = ""
 	}
 
 	// Second factor required: mint a signed pending token and tell the client
-	// whether to enroll (no confirmed secret yet) or verify.
-	if needs2FA {
-		_, confirmed, err := a.cfg.TwoFactor.Store.Secret(ctx, storedUser.TenantID, email)
-		if err != nil {
-			a.log.Error("totp secret lookup failed", "err", err)
-			a.writeError(w, r, http.StatusInternalServerError, ErrCodeServerError, "internal error")
-			return
-		}
-		action := "verify"
-		if !confirmed {
-			action = "enroll"
-		}
+	// whether to enroll or verify.
+	if action != "" {
 		writeJSON(w, http.StatusOK, map[string]string{
 			"status":        "2fa_required",
 			"action":        action,

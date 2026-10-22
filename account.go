@@ -1,6 +1,9 @@
 package authkit
 
-import "net/http"
+import (
+	"context"
+	"net/http"
+)
 
 // Self-service account & security endpoints for an authenticated user. These
 // complement the login-time flows: a logged-in user can rotate their own
@@ -102,7 +105,10 @@ func (a *Auth) LogoutEverywhere(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	// "Log out everywhere" also forgets every trusted device, so a 2FA role is
-	// challenged again on each device next login.
+	// challenged again on each device next login. Other accounts this browser
+	// remembers are kept; they are picked out before the revoke, which is the
+	// only point an unlabelled v2.0.0 token can still be told apart.
+	otherTrust := a.trustedEntriesExcept(ctx, r, u.TenantID, u.Email)
 	a.revokeTrustedDevices(ctx, u.TenantID, u.Email)
 	// ...and revokes every refresh token, so "log out all devices" truly
 	// includes the bearer axis (an offboarding revoke cuts off native apps too).
@@ -110,7 +116,7 @@ func (a *Auth) LogoutEverywhere(w http.ResponseWriter, r *http.Request) {
 		_ = a.cfg.Tokens.RefreshStore.RevokeAllForUser(ctx, u.TenantID, u.Email)
 	}
 	a.clearSIDCookie(w)
-	a.clearTrustedDeviceCookie(w)
+	a.setTrustedEntries(w, otherTrust)
 	a.emitAudit(ctx, AuditEvent{Type: AuditRevoke, TenantID: u.TenantID, Actor: u.Email, Subject: u.Email, IP: a.clientIP(r), At: nowFn(), Meta: map[string]any{"scope": "all"}})
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
@@ -168,7 +174,10 @@ func (a *Auth) ConfirmTwoFactor(w http.ResponseWriter, r *http.Request) {
 
 // DisableTwoFactor turns off the current user's 2FA. Refused when the user's
 // role mandates 2FA (they would be forced to re-enroll at next login anyway).
-// Mount on: POST /auth/2fa/disable.
+// Turning the second factor off takes the second factor: a current code or a
+// recovery code, since a session alone (an unlocked till, a stolen cookie) must
+// not be enough to remove what sign-in now enforces.
+// Mount on: POST /auth/2fa/disable. Fields: code (6-digit TOTP) or recovery_code.
 func (a *Auth) DisableTwoFactor(w http.ResponseWriter, r *http.Request) {
 	mgr, ok := a.totpManager(w, r)
 	if !ok {
@@ -183,6 +192,9 @@ func (a *Auth) DisableTwoFactor(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := WithTenant(r.Context(), u.TenantID)
+	if !a.requireSecondFactor(ctx, w, r, u) {
+		return
+	}
 	if err := mgr.Disable(ctx, u.TenantID, u.Email); err != nil {
 		a.log.Error("disable 2fa failed", "err", err)
 		a.writeError(w, r, http.StatusInternalServerError, ErrCodeServerError, "internal error")
@@ -194,9 +206,31 @@ func (a *Auth) DisableTwoFactor(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
+// requireSecondFactor checks the current code or recovery code that a request
+// managing the user's own 2FA carries, writing the error and returning false
+// when it does not pass. Attempts are throttled like a login, under their own
+// key, so a stolen session cannot walk the million 6-digit codes.
+func (a *Auth) requireSecondFactor(ctx context.Context, w http.ResponseWriter, r *http.Request, u *User) bool {
+	parseBody(r)
+	tkey := throttleKey("2fa-manage:"+u.Email, a.clientIP(r))
+	if !a.throttleAllow(w, r, tkey) {
+		return false
+	}
+	if !a.validate2FA(ctx, u.TenantID, u.Email, r) {
+		a.throttleFailure(ctx, tkey)
+		a.writeError(w, r, http.StatusBadRequest, ErrCodeInvalidCode, "a current code or recovery code is required")
+		return false
+	}
+	a.throttleReset(ctx, tkey)
+	return true
+}
+
 // RegenerateRecoveryCodes issues a fresh set of recovery codes for a user whose
 // 2FA is already confirmed, invalidating the old set, and returns the new codes
-// to show once. Mount on: POST /auth/2fa/recovery/regenerate.
+// to show once. Like DisableTwoFactor it takes the second factor: a recovery
+// code passes sign-in and turns 2FA off, so handing a fresh set to a session
+// alone would undo both. Mount on: POST /auth/2fa/recovery/regenerate.
+// Fields: code (6-digit TOTP) or recovery_code.
 func (a *Auth) RegenerateRecoveryCodes(w http.ResponseWriter, r *http.Request) {
 	mgr, ok := a.totpManager(w, r)
 	if !ok {
@@ -214,6 +248,9 @@ func (a *Auth) RegenerateRecoveryCodes(w http.ResponseWriter, r *http.Request) {
 	}
 	if secret == "" || !confirmed {
 		a.writeError(w, r, http.StatusBadRequest, ErrCodeInvalidRequest, "two-factor authentication is not enabled")
+		return
+	}
+	if !a.requireSecondFactor(ctx, w, r, u) {
 		return
 	}
 	plain, hashes, err := generateRecoveryCodes(recoveryCodeCount)
