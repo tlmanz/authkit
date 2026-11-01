@@ -1,6 +1,6 @@
 module github.com/tlmanz/authkit/v2
 
-go 1.25.0
+go 1.26.0
 
 require (
 	github.com/golang-jwt/jwt/v5 v5.3.1
@@ -19,5 +19,6 @@ require (
 	github.com/gorilla/mux v1.6.2 // indirect
 	github.com/gorilla/securecookie v1.1.2 // indirect
 	github.com/kr/text v0.2.0 // indirect
+	github.com/stretchr/testify v1.12.1 // indirect
 	golang.org/x/oauth2 v0.27.0 // indirect
 )
