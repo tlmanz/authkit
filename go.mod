@@ -1,13 +1,13 @@
 module github.com/tlmanz/authkit/v2
 
-go 1.25.0
+go 1.26.0
 
 require (
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/gorilla/sessions v1.4.0
 	github.com/markbates/goth v1.82.0
 	github.com/pquerna/otp v1.5.0
-	golang.org/x/crypto v0.54.0
+	golang.org/x/crypto v0.58.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
