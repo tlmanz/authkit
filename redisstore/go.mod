@@ -3,7 +3,7 @@ module github.com/tlmanz/authkit/redisstore/v2
 go 1.25.0
 
 require (
-	github.com/alicebob/miniredis/v2 v2.35.0
+	github.com/alicebob/miniredis/v2 v2.40.0
 	github.com/redis/go-redis/v9 v9.21.0
 	github.com/tlmanz/authkit/v2 v2.0.0
 )
